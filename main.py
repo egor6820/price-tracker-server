@@ -41,35 +41,26 @@ def parse_product(req: ParseRequest):
                 })
                 
                 try:
-                    page.goto(url, timeout=180000)  # Ще збільшено таймаут
-                    page.wait_for_load_state('networkidle', timeout=90000)  # Збільшено таймаут
-                    page.wait_for_timeout(20000)  # Збільшено час на JS
+                    page.goto(url, timeout=60000)
+                    page.wait_for_load_state('networkidle', timeout=30000)
+                    page.wait_for_timeout(5000)  # Час на JS
                 except PlaywrightTimeout:
                     print("Timeout error loading page")
-                    browser.close()
                     return ParseResponse(name="Помилка завантаження", currentPrice="Помилка", oldPrice=None, inStock=False)
 
                 # Специфічне очікування для Rozetka
-                if "rozetka.com.ua" in url:
-                    try:
-                        page.wait_for_selector("h1.product__title, h1.product__heading, h1.ng-star-inserted, h1.product__name, h1.rz-product__name", timeout=60000)  # Очікування селектора назви з збільшеним таймаутом
-                    except PlaywrightTimeout:
-                        print("Timeout waiting for name selector")
-                    try:
-                        page.wait_for_selector("p.product-price__big, span.product-prices__big, div.product-prices__big", timeout=60000)  # Очікування селектора ціни
-                    except PlaywrightTimeout:
-                        print("Timeout waiting for price selector")
-                    try:
-                        page.wait_for_selector("[class*='status-label']", timeout=60000)  # Очікування для stock
-                    except PlaywrightTimeout:
-                        print("Timeout waiting for stock selector")
+                try:
+                    if "rozetka.com.ua" in url:
+                        page.wait_for_selector("p.product-price__big", timeout=30000)  # Оновлений селектор з твого фрагменту
+                except PlaywrightTimeout:
+                    print("Timeout waiting for price selector")
 
                 html = page.content()
                 browser.close()
         else:
             r = requests.get(url, headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3"
-            }, timeout=60)  # Збільшено таймаут
+            }, timeout=30)
             html = r.text
 
         # Дебаг: подивись в консоль, чи є HTML
@@ -80,12 +71,12 @@ def parse_product(req: ParseRequest):
         # Логіка для Rozetka з оновленими селекторами
         if "rozetka.com.ua" in url:
             # Назва: альтернативи
-            name_tag = soup.select_one("h1.product__title, h1.product__heading, h1.ng-star-inserted, [itemprop='name'], h1.product__name, h1.rz-product__name")
+            name_tag = soup.select_one("h1.product__title, h1.product__heading, h1.ng-star-inserted, [itemprop='name']")
             name = name_tag.get_text().strip() if name_tag else "Невідома назва"
             print(f"Found name: {name}")  # Дебаг
 
-            # Поточна ціна: додали більше варіантів, включаючи span
-            currentPriceTag = soup.select_one("p.product-price__big, span.product-prices__big, p.product-prices__big, div.product-prices__big, [class*='product-price__big'], [class*='product-prices__big'], [itemprop='price'], meta[property='product:price:amount'], div.product-price p, span.price")
+            # Поточна ціна: з твого фрагменту, з альтернативами
+            currentPriceTag = soup.select_one("p.product-price__big, [class*='product-price__big'], [itemprop='price'], meta[property='product:price:amount']")
             if currentPriceTag:
                 if currentPriceTag.name == "meta":
                     currentPrice = currentPriceTag.get("content", "Невідома ціна")
@@ -95,17 +86,17 @@ def parse_product(req: ParseRequest):
                 currentPrice = "Невідома ціна"
             print(f"Found current price: {currentPrice}")  # Дебаг
             
-            # Стара ціна: додали більше варіантів
-            oldPriceTag = soup.select_one("p.product-price__small, span.product-prices__small, p.product-prices__small, [class*='product-price__small'], [class*='product-prices__small'], .product-price__old, .old-price")
+            # Стара ціна: альтернативи
+            oldPriceTag = soup.select_one("p.product-price__small, [class*='product-price__small'], .product-price__old, .old-price")
             oldPrice = oldPriceTag.get_text().strip() if oldPriceTag else None
             print(f"Found old price: {oldPrice}")  # Дебаг
             
             # Наявність: шукаємо клас або текст
             stock_tag = (
-                soup.select_one("[class*='status-label'], .product-availability, [class*='status-label--green'], [class*='status-label--red'], .status-label") or
-                soup.find(lambda tag: tag.text and ("наявності" in tag.text.lower() or "в наявності" in tag.text.lower() or "є в наявності" in tag.text.lower()))
+                soup.select_one("[class*='status-label'], .product-availability") or
+                soup.find(lambda tag: tag.text and "наявності" in tag.text.lower())
             )
-            inStock = bool(stock_tag) and "наявності" not in stock_tag.get_text().lower()  # Якщо є тег, і не "немає в наявності"
+            inStock = bool(stock_tag)
             print(f"Found inStock: {inStock}")  # Дебаг
         else:
             # Загальна логіка для інших
