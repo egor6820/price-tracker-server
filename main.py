@@ -9,7 +9,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # змінити на конкретний домен для безпеки, якщо потрібно
+    allow_origins=["*"],  # Змінити на конкретний домен для безпеки
     allow_methods=["*"],
     allow_headers=["*"]
 )
@@ -34,14 +34,17 @@ def parse_product(req: ParseRequest):
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True)
                 page = browser.new_page()
-                
+
                 # User-Agent, щоб не блокувало Cloudflare
                 page.set_extra_http_headers({
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.5845.140 Safari/537.36"
                 })
 
-                page.goto(url)
-                page.wait_for_timeout(5000)  # 5 секунд для JS
+                # Завантаження сторінки з таймаутом 60 секунд
+                page.goto(url, timeout=60000, wait_until="networkidle")
+
+                # Додаткова пауза для JS
+                page.wait_for_timeout(5000)
 
                 html = page.content()
                 browser.close()
@@ -54,7 +57,7 @@ def parse_product(req: ParseRequest):
 
         soup = BeautifulSoup(html, 'html.parser')
 
-        # Назва
+        # Назва товару
         name = soup.title.string.strip() if soup.title else "Невідома назва"
 
         # Поточна ціна
@@ -80,7 +83,7 @@ def parse_product(req: ParseRequest):
         )
         oldPrice = oldPriceTag.get_text().strip() if oldPriceTag else None
 
-        # Наявність
+        # Наявність товару
         inStock = bool(soup.select_one(".in-stock, .available")) or True
 
         return ParseResponse(name=name, currentPrice=currentPrice, oldPrice=oldPrice, inStock=inStock)
