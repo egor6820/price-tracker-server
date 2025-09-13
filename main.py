@@ -9,7 +9,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Змінити на конкретний домен для безпеки
+    allow_origins=["*"],  # змінити на конкретний домен для безпеки
     allow_methods=["*"],
     allow_headers=["*"]
 )
@@ -29,27 +29,23 @@ def parse_product(req: ParseRequest):
     try:
         html = ""
 
-        # Використовуємо Playwright для Rozetka та AliExpress
+        # Rozetka / AliExpress
         if "aliexpress.com" in url or "rozetka.com.ua" in url:
             with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
+                browser = p.chromium.launch(headless=True, slow_mo=50)
                 page = browser.new_page()
-
-                # User-Agent, щоб не блокувало Cloudflare
+                
                 page.set_extra_http_headers({
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.5845.140 Safari/537.36"
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.5845.140 Safari/537.36",
+                    "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
                 })
 
-                # Завантаження сторінки з таймаутом 60 секунд
-                page.goto(url, timeout=60000, wait_until="networkidle")
-
-                # Додаткова пауза для JS
-                page.wait_for_timeout(5000)
-
+                page.goto(url, timeout=120000, wait_until="domcontentloaded")
+                page.wait_for_timeout(3000)
                 html = page.content()
                 browser.close()
         else:
-            # Для інших сайтів requests
             r = requests.get(url, headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3"
             })
@@ -57,33 +53,28 @@ def parse_product(req: ParseRequest):
 
         soup = BeautifulSoup(html, 'html.parser')
 
-        # Назва товару
+        # Назва
         name = soup.title.string.strip() if soup.title else "Невідома назва"
 
         # Поточна ціна
         currentPriceTag = (
-            soup.select_one("meta[property='product:price:amount']") or
+            soup.select_one(".product-prices__big") or
+            soup.select_one(".product-price__current") or
             soup.select_one("[itemprop='price']") or
-            soup.select_one("span.price, .price-current, .snow-price_SnowPrice-main") or
-            soup.select_one("div.price, .price-value") or
-            soup.select_one(".product-price__current")  # Rozetka
+            soup.select_one("meta[property='product:price:amount']")
         )
-        if currentPriceTag:
-            if currentPriceTag.name == "meta":
-                currentPrice = currentPriceTag["content"]
-            else:
-                currentPrice = currentPriceTag.get_text().strip()
-        else:
-            currentPrice = "Невідома ціна"
+        currentPrice = currentPriceTag.get_text().strip() if currentPriceTag and currentPriceTag.name != "meta" else (
+            currentPriceTag["content"] if currentPriceTag else "Невідома ціна"
+        )
 
         # Стара ціна
         oldPriceTag = (
-            soup.select_one(".old-price, .price-old, .product-old-price, .snow-price_SnowPrice-old") or
-            soup.select_one(".product-price__old")  # Rozetka
+            soup.select_one(".product-price__old") or
+            soup.select_one(".product-prices__small")
         )
         oldPrice = oldPriceTag.get_text().strip() if oldPriceTag else None
 
-        # Наявність товару
+        # Наявність
         inStock = bool(soup.select_one(".in-stock, .available")) or True
 
         return ParseResponse(name=name, currentPrice=currentPrice, oldPrice=oldPrice, inStock=inStock)
