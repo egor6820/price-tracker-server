@@ -33,29 +33,27 @@ def parse_product(req: ParseRequest):
                 browser = p.chromium.launch(headless=True)
                 page = browser.new_page()
                 
-                # Різні User-Agent для обходу Cloudflare/захисту
-                user_agents = [
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.5845.140 Safari/537.36",
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/117.0"
-                ]
+                # Розширені headers
                 page.set_extra_http_headers({
-                    "User-Agent": user_agents[0]  # Можна рандомізувати
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.5845.140 Safari/537.36",
+                    "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
                 })
                 
                 try:
                     page.goto(url, timeout=60000)
+                    page.wait_for_load_state('networkidle', timeout=30000)
+                    page.wait_for_timeout(5000)  # Час на JS
                 except PlaywrightTimeout:
+                    print("Timeout error loading page")
                     return ParseResponse(name="Помилка завантаження", currentPrice="Помилка", oldPrice=None, inStock=False)
 
-                # Очікування для конкретних сайтів з більшим таймаутом
+                # Специфічне очікування для Rozetka
                 try:
                     if "rozetka.com.ua" in url:
-                        page.wait_for_selector("p.product-prices__big", timeout=30000)  # Оновлений селектор для Rozetka
-                    elif "allo.ua" in url:
-                        page.wait_for_selector(".price, .product-title", timeout=30000)
+                        page.wait_for_selector("p.product-price__big", timeout=30000)  # Оновлений селектор з твого фрагменту
                 except PlaywrightTimeout:
-                    pass  # Продовжуємо, якщо не знайдено
+                    print("Timeout waiting for price selector")
 
                 html = page.content()
                 browser.close()
@@ -65,25 +63,43 @@ def parse_product(req: ParseRequest):
             }, timeout=30)
             html = r.text
 
+        # Дебаг: подивись в консоль, чи є HTML
+        print(f"Loaded HTML snippet: {html[:1000]}...")
+
         soup = BeautifulSoup(html, 'html.parser')
 
-        # Сайт-специфічна логіка для парсингу
+        # Логіка для Rozetka з оновленими селекторами
         if "rozetka.com.ua" in url:
-            # Оновлені селектори для Rozetka (перевір і онови за потребою)
-            name_tag = soup.select_one("h1.product__heading") or soup.select_one("h1.product__title")
+            # Назва: альтернативи
+            name_tag = soup.select_one("h1.product__title, h1.product__heading, h1.ng-star-inserted, [itemprop='name']")
             name = name_tag.get_text().strip() if name_tag else "Невідома назва"
+            print(f"Found name: {name}")  # Дебаг
+
+            # Поточна ціна: з твого фрагменту, з альтернативами
+            currentPriceTag = soup.select_one("p.product-price__big, [class*='product-price__big'], [itemprop='price'], meta[property='product:price:amount']")
+            if currentPriceTag:
+                if currentPriceTag.name == "meta":
+                    currentPrice = currentPriceTag.get("content", "Невідома ціна")
+                else:
+                    currentPrice = currentPriceTag.get_text().strip()  # Візьме "570₴"
+            else:
+                currentPrice = "Невідома ціна"
+            print(f"Found current price: {currentPrice}")  # Дебаг
             
-            currentPriceTag = soup.select_one("p.product-prices__big")
-            currentPrice = currentPriceTag.get_text().strip() if currentPriceTag else "Невідома ціна"
-            
-            oldPriceTag = soup.select_one("p.product-prices__small")
+            # Стара ціна: альтернативи
+            oldPriceTag = soup.select_one("p.product-price__small, [class*='product-price__small'], .product-price__old, .old-price")
             oldPrice = oldPriceTag.get_text().strip() if oldPriceTag else None
+            print(f"Found old price: {oldPrice}")  # Дебаг
             
-            # Наявність: шукаємо текст "В наявності" або клас
-            stock_tag = soup.select_one(".status-label--green") or soup.find(string=lambda text: "наявності" in text.lower() if text else False)
+            # Наявність: шукаємо клас або текст
+            stock_tag = (
+                soup.select_one("[class*='status-label'], .product-availability") or
+                soup.find(lambda tag: tag.text and "наявності" in tag.text.lower())
+            )
             inStock = bool(stock_tag)
+            print(f"Found inStock: {inStock}")  # Дебаг
         else:
-            # Загальна логіка для інших сайтів
+            # Загальна логіка для інших
             name_tag = soup.select_one("title") or soup.select_one(".product-title, .product-name, h1")
             name = name_tag.get_text().strip() if name_tag else "Невідома назва"
 
