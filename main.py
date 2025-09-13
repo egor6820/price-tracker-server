@@ -2,14 +2,13 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from bs4 import BeautifulSoup
-import requests
 from playwright.sync_api import sync_playwright
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # змінити на конкретний домен для безпеки
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"]
 )
@@ -29,26 +28,24 @@ def parse_product(req: ParseRequest):
     try:
         html = ""
 
-        # Rozetka / AliExpress
         if "aliexpress.com" in url or "rozetka.com.ua" in url:
             with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True, slow_mo=50)
+                browser = p.chromium.launch(headless=True)
                 page = browser.new_page()
-                
                 page.set_extra_http_headers({
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.5845.140 Safari/537.36",
-                    "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+                                  " AppleWebKit/537.36 (KHTML, like Gecko)"
+                                  " Chrome/116.0.5845.140 Safari/537.36"
                 })
-
-                page.goto(url, timeout=120000, wait_until="domcontentloaded")
-                page.wait_for_timeout(3000)
+                page.goto(url, timeout=60000)  # 60 секунд
+                page.wait_for_timeout(5000)    # 5 секунд для JS
                 html = page.content()
                 browser.close()
         else:
+            import requests
             r = requests.get(url, headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3"
-            })
+                "User-Agent": "Mozilla/5.0"
+            }, timeout=30)
             html = r.text
 
         soup = BeautifulSoup(html, 'html.parser')
@@ -58,19 +55,18 @@ def parse_product(req: ParseRequest):
 
         # Поточна ціна
         currentPriceTag = (
-            soup.select_one(".product-prices__big") or
-            soup.select_one(".product-price__current") or
+            soup.select_one("meta[property='product:price:amount']") or
             soup.select_one("[itemprop='price']") or
-            soup.select_one("meta[property='product:price:amount']")
+            soup.select_one("span.price, .price-current, .snow-price_SnowPrice-main") or
+            soup.select_one("div.price, .price-value") or
+            soup.select_one(".product-price__current")
         )
-        currentPrice = currentPriceTag.get_text().strip() if currentPriceTag and currentPriceTag.name != "meta" else (
-            currentPriceTag["content"] if currentPriceTag else "Невідома ціна"
-        )
+        currentPrice = currentPriceTag["content"] if currentPriceTag and currentPriceTag.name == "meta" else currentPriceTag.get_text().strip() if currentPriceTag else "Невідома ціна"
 
         # Стара ціна
         oldPriceTag = (
-            soup.select_one(".product-price__old") or
-            soup.select_one(".product-prices__small")
+            soup.select_one(".old-price, .price-old, .product-old-price, .snow-price_SnowPrice-old") or
+            soup.select_one(".product-price__old")
         )
         oldPrice = oldPriceTag.get_text().strip() if oldPriceTag else None
 
