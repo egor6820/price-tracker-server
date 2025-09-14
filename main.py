@@ -16,10 +16,9 @@ SELECTORS_FILE = "site_selectors.json"
 app = FastAPI()
 
 # --- Health check endpoint для UptimeRobot / Render ---
-@app.get("/")
-def root():
+@app.get("/ping")
+def ping():
     return {"status": "ok"}
-
 
 app.add_middleware(
     CORSMiddleware,
@@ -709,5 +708,6 @@ def parse_product(req: ParseRequest):
         print("Error in parse_product:", e)
         traceback.print_exc()
         return ParseResponse(name="Невідома назва", currentPrice="Невідома ціна", oldPrice=None, inStock=False)
+
 
 
