@@ -84,31 +84,79 @@ def contains_currency(text: Optional[str]) -> bool:
     for cur in CURRENCY_KEYWORDS:
         if cur in t:
             return True
-    # також шукаємо скорочення без символа, наприклад "грн."
-    if re.search(r"\bгрн\b|\buah\b|\busd\b|\beur\b|\b₴\b", t):
+    if re.search(r"\bгрн\b|\buah\b|\busd\b|\beur\b", t):
         return True
     return False
 
 def clean_price_text(text: Optional[str]) -> Optional[str]:
-    """Збирає число з тексту і повертає рядок з крапкою як десятковим розділювачем або None."""
+    """
+    Нормалізує рядок з числом з урахуванням тисячних та десяткових роздільників.
+    Повертає рядок з крапкою в ролі десятичного роздільника, або None.
+    """
     if not text:
         return None
-    txt = text.strip()
-    txt = txt.replace("\xa0", " ").replace("\u00A0", " ")
-    m = re.search(r"([0-9]{1,3}(?:[ \u00A0][0-9]{3})*(?:[.,][0-9]{1,2})?|[0-9]+(?:[.,][0-9]{1,2})?)", txt)
-    if m:
-        found = m.group(1)
-        cleaned = found.replace(" ", "").replace("\u00A0", "").replace(",", ".")
-        try:
-            val = float(cleaned)
-            if val <= 0:
-                return None
-        except:
-            return None
-        if cleaned.endswith(".0"):
-            cleaned = cleaned[:-2]
-        return cleaned
-    return None
+    # Видаляємо непотрібні пробіли/NBSP зверху/знизу, але зберігаємо внутрішні символи для аналізу
+    s = str(text).strip()
+    s = s.replace("\u00A0", " ").replace("\xa0", " ")
+    # Витягнемо перший корисний фрагмент, що містить цифри, коми, крапки та пробіли
+    m = re.search(r"[-+]?[0-9\.\,\s\u00A0\u202F]{1,50}", s)
+    if not m:
+        return None
+    num_s = m.group(0).strip()
+    # Видаляємо пробіли (звичайні) — зазвичай вони є сепараторами тисяч
+    num_s = num_s.replace(" ", "")
+    # Тепер у num_s можуть бути коми і/або крапки.
+    # Якщо присутні і ',' і '.': правіший роздільник є десятковим
+    if ',' in num_s and '.' in num_s:
+        if num_s.rfind(',') > num_s.rfind('.'):
+            # кома — десятковий, точки — тисячні
+            normalized = num_s.replace('.', '').replace(',', '.')
+        else:
+            # крапка — десятковий, коми — тисячні
+            normalized = num_s.replace(',', '')
+    elif ',' in num_s:
+        # лише коми: якщо кома стоїть перед групами по 3 цифри -> тисячні, інакше — десяткова
+        # приклад: 1,280  -> тисячні (початкове число), але 1,28 -> десяткова
+        if re.search(r",\d{3}(?!\d)", num_s):
+            normalized = num_s.replace(',', '')
+        else:
+            normalized = num_s.replace(',', '.')
+    elif '.' in num_s:
+        # лише крапки: схожа логіка
+        if re.search(r"\.\d{3}(?!\d)", num_s):
+            normalized = num_s.replace('.', '')
+        else:
+            normalized = num_s
+    else:
+        normalized = num_s
+
+    # Видалимо все окрім цифр, крапки, мінуса та плюса
+    normalized = re.sub(r"[^\d\.\-+]", "", normalized)
+
+    if not normalized:
+        return None
+
+    # Якщо є більше однієї крапки — залишимо останню як десяткову, видаливши інші
+    if normalized.count('.') > 1:
+        parts = normalized.split('.')
+        # з'єднаємо всі частини крім останньої, потім додамо останню через крапку
+        normalized = ''.join(parts[:-1]) + '.' + parts[-1]
+
+    # Спроба перетворити у float
+    try:
+        val = float(normalized)
+    except Exception:
+        return None
+    if val <= 0:
+        # вважаємо неціною або безглуздою
+        return None
+    # Повертаємо компактне представлення: без .0 якщо ціле
+    if val.is_integer():
+        return str(int(val))
+    else:
+        # обрізати зайві нулі в кінці
+        sres = ("{:.2f}".format(val)).rstrip('0').rstrip('.')
+        return sres
 
 def text_has_digits_and_not_placeholder(text: Optional[str]) -> bool:
     if not text:
@@ -231,18 +279,8 @@ def find_best_price(soup: BeautifulSoup) -> Tuple[Optional[str], Optional[str], 
         if cp:
             return cp, None, it
 
-    # 3) ld+json offers handled elsewhere, but double-check meta with priceCurrency+amount:
-    # (Handled in parse_product via extract_ld_json)
-
-    # 4) Збираємо кандидатів з DOM
+    # 3) Збираємо кандидатів з DOM
     candidates = []
-    # a) явні атрибути data-price
-    for tag in soup.find_all(attrs={"data-price": True}):
-        txt = tag_text_or_attr(tag)
-        cp = clean_price_text(txt)
-        if cp:
-            candidates.append((tag, txt, cp, score_price_candidate(tag, txt)))
-    # b) теги span/p/div/strong/meta з числами
     for tag in soup.find_all():
         if tag.name not in ("span","p","div","strong","b","li","a","td","em","meta"):
             continue
@@ -259,61 +297,44 @@ def find_best_price(soup: BeautifulSoup) -> Tuple[Optional[str], Optional[str], 
 
     if candidates:
         candidates_sorted = sorted(candidates, key=lambda x: x[3], reverse=True)
-        # вибираємо перший валідний з додатковими перевірками
         for best_tag, best_text, best_cp, best_score in candidates_sorted:
-            # визначимо числове значення
             try:
                 num = float(best_cp)
             except:
                 num = None
             has_currency = contains_currency(best_text) or contains_currency(tag_text_or_attr(best_tag))
-            # якщо без валюти і дуже маленьке число (ймовірно артефакт) — вимагаємо, щоб tag.class/id містили "price"
             cls_id = " ".join(filter(None, [(" ".join(best_tag.get("class")) if best_tag.get("class") else ""), best_tag.get("id") or ""]))
             has_price_class = bool(re.search(r"(price|product-price|price__|цiн|ціна|грн|uah|cost|amount|sum|sale|old-price)", cls_id, flags=re.I))
             if not has_currency:
-                # якщо число <20 і немає price-class — відкидаємо
                 if num is not None and num < 20 and not has_price_class:
-                    # пропускаємо кандидат
                     continue
-            # Якщо пройшли перевірку — спробуємо знайти old price поруч
+            # пошук old price поруч
             old_price = None
             parent = best_tag.parent
             if parent:
-                # шукати в сусідніх елементах з "old" чи strike
                 for child in parent.find_all():
                     if child == best_tag:
                         continue
                     ch_txt = tag_text_or_attr(child)
                     if not ch_txt or not re.search(r"\d", ch_txt):
                         continue
-                    if re.search(r"(old|previous|strike|crossed|product-price__small|product-old|price--old|sale|strikethrough)", " ".join(filter(None, [child.get("class") and " ".join(child.get("class"),), child.get("id") or ""])), flags=0) if False else False:
-                        pass  # старий спосіб — може не спрацьовувати, тому нижче загальний варіант
-                    # якщо в тексті є валюта або клас містить old/strike — вважаємо старою ціною
-                    if contains_currency(ch_txt) or re.search(r"(old|previous|strike|product-price__small|product-old|price--old)", " ".join(filter(None, [child.get("class") and " ".join(child.get("class")), child.get("id") or ""])), flags=re.I):
-                        op = clean_price_text(ch_txt)
-                        if op and op != best_cp:
-                            old_price = op
-                            break
-                    # ще перевірка: якщо інше число в parent і відрізняється від best_cp — можливий old_price
-                    op2 = clean_price_text(ch_txt)
-                    if op2 and op2 != best_cp and contains_currency(ch_txt):
-                        old_price = op2
+                    op = clean_price_text(ch_txt)
+                    if op and op != best_cp and (contains_currency(ch_txt) or re.search(r"(old|previous|strike|product-price__small|product-old|price--old)", " ".join(filter(None, [child.get("class") and " ".join(child.get("class"),), child.get("id") or ""])), flags=re.I) if False else True):
+                        old_price = op
                         break
             return best_cp, old_price, best_tag
 
-    # 5) fallback regex: шукаємо патерни з валютою першими
+    # 4) fallback regex: спершу шукаємо з валютою
     full_text = soup.get_text(" ", strip=True)
     m = re.search(r"([0-9]{1,3}(?:[ \u00A0][0-9]{3})*(?:[.,][0-9]{1,2})?)\s*(грн|₴|uah|usd|\$|€|eur|руб|₽)", full_text, flags=re.I)
     if m:
         cp = clean_price_text(m.group(1))
         if cp:
             return cp, None, None
-    # загальний перший номер (менш бажаний)
     m2 = re.search(r"([0-9]{1,3}(?:[ \u00A0][0-9]{3})*(?:[.,][0-9]{1,2})?)", full_text)
     if m2:
         cp = clean_price_text(m2.group(1))
         if cp:
-            # якщо дуже мале число і немає валюти в околі — не беремо
             num = float(cp)
             surrounding = full_text[max(0, m2.start()-40):m2.end()+40]
             if num < 20 and not contains_currency(surrounding):
@@ -367,19 +388,15 @@ def find_best_name(soup: BeautifulSoup, price_tag: Optional[Tag] = None) -> Opti
         if txt and is_valid_name_candidate(txt):
             candidates.append(txt)
     if candidates:
-        # повернути найкоротший або перший інформативний
         candidates_sorted = sorted(candidates, key=lambda x: len(x))
         return candidates_sorted[0]
 
-    # 5) proximity heuristic: якщо є price_tag
+    # 5) proximity heuristic
     if price_tag:
         nearby = find_nearby_name(price_tag)
         if nearby and is_valid_name_candidate(nearby):
             return nearby
 
-    # 6) останній фолбек: перші речення / фрагмент тексту, але фільтруємо плейсхолдери
-    body_text = soup.get_text(" ", strip=True)
-    # шукаємо короткі рядки, які можуть бути заголовками
     lines = [l.strip() for l in re.split(r"\n+", soup.get_text()) if l.strip()]
     for l in lines:
         if len(l) > 4 and len(l.split()) < 25 and is_valid_name_candidate(l):
@@ -391,23 +408,19 @@ def is_valid_name_candidate(text: Optional[str]) -> bool:
     if not text:
         return False
     t = text.strip()
-    # відкидаємо плейсхолдери
     low = t.lower()
     for kw in PLACEHOLDER_KEYWORDS:
         if kw in low:
             return False
-    # відкидаємо якщо багато крапок або лише символи
     if re.match(r"^[\.\-\,\s]+$", t):
         return False
-    if re.search(r"\.{3,}", t):  # "....." або "...."
+    if re.search(r"\.{3,}", t):
         return False
-    # дуже коротке (1-2 символи) — відкидаємо
     if len(re.sub(r"\s+", "", t)) < 3:
         return False
     return True
 
 def find_nearby_name(price_tag: Tag) -> Optional[str]:
-    """Шукаємо заголовок поблизу блоку ціни (до 4 рівнів вгору)."""
     if not price_tag:
         return None
     node = price_tag
@@ -415,12 +428,10 @@ def find_nearby_name(price_tag: Tag) -> Optional[str]:
         node = node.parent
         if not node:
             break
-        # шукаємо h1-h3 в цьому блоці
         for h in node.find_all(["h1","h2","h3"]):
             txt = h.get_text(" ", strip=True)
             if is_valid_name_candidate(txt):
                 return txt
-        # шукаємо елементи з класом title/product-name
         t = node.find(True, class_=re.compile(r"(title|product|name|goods|item)", flags=re.I))
         if t:
             txt = tag_text_or_attr(t)
@@ -555,20 +566,16 @@ def parse_product(req: ParseRequest):
                 extracted = extract_with_playwright_direct(url, domain_cfg=domain_cfg, wait_for_price_sec=25)
                 html = extracted.get("html") or ""
                 if extracted.get("name"):
-                    # фільтруємо плейсхолдери прямо тут
                     cand = extracted["name"].strip()
                     if is_valid_name_candidate(cand):
                         name = cand
                 if extracted.get("price_text"):
                     cp = clean_price_text(extracted["price_text"])
-                    # додаткова перевірка: якщо число мале і немає валюти — поки не приймати
                     if cp:
                         if contains_currency(extracted["price_text"]) or float(cp) >= 20:
                             currentPrice = cp
                         else:
-                            # якщо page селектор був price (domain_cfg) — дозволяємо
-                            # але перевіримо чи селектор явно price
-                            # для безпечності поки відхиляємо
+                            # якщо селектор домену явно price — можна дозволити, але зараз ми консервативні
                             pass
                 if extracted.get("old_price_text"):
                     op = clean_price_text(extracted["old_price_text"])
@@ -585,7 +592,7 @@ def parse_product(req: ParseRequest):
 
         soup = BeautifulSoup(html, "html.parser")
 
-        # ld+json (найбільш надійний перший варіант)
+        # ld+json
         if not name or not currentPrice:
             for item in extract_ld_json(soup):
                 if not name:
@@ -605,7 +612,7 @@ def parse_product(req: ParseRequest):
                         if avail:
                             inStock = not ("outofstock" in str(avail).lower() or "notavailable" in str(avail).lower())
 
-        # domain-specific selectors (збережено вашу логіку)
+        # domain-specific selectors
         if domain_cfg:
             if not currentPrice:
                 for sel in domain_cfg.get("price", []):
@@ -616,7 +623,6 @@ def parse_product(req: ParseRequest):
                         else:
                             cp = clean_price_text(tag.get_text(" ", strip=True))
                         if cp:
-                            # якщо немає валюти і число <20 — перевіримо чи селектор явно price по назвам класів
                             txt = tag_text_or_attr(tag)
                             if contains_currency(txt) or float(cp) >= 20 or re.search(r"(price|product-price|грн|uah)", " ".join(filter(None, [tag.get("class") and " ".join(tag.get("class")), tag.get("id") or ""])), flags=re.I):
                                 currentPrice = cp
@@ -639,7 +645,7 @@ def parse_product(req: ParseRequest):
                             oldPrice = op
                             break
 
-        # ---- NEW: потужні фолбеки для будь-якого сайту ----
+        # powerful fallbacks
         price_tag = None
         if not currentPrice:
             cp, op, ptag = find_best_price(soup)
@@ -649,13 +655,11 @@ def parse_product(req: ParseRequest):
             if op and not oldPrice:
                 oldPrice = op
 
-        # Якщо маємо ціну, спробуємо знайти назву поруч або звичні заголовки
         if not name:
             name_try = find_best_name(soup, price_tag=price_tag)
             if name_try:
                 name = name_try
 
-        # Додатковий фолбек: шукати елементи з класами що містять title/product/name
         if not name:
             candidates = []
             for sel in ["[class*='title']", "[class*='product']", "[id*='title']", "[id*='product']", "[class*='name']"]:
@@ -666,7 +670,6 @@ def parse_product(req: ParseRequest):
             if candidates:
                 name = sorted(candidates, key=lambda x: len(x))[0]
 
-        # Фінальний фолбек для ціни: regex з преферуванням валюти
         if not currentPrice:
             full_text = soup.get_text(" ", strip=True)
             m = re.search(r"([0-9]{1,3}(?:[ \u00A0][0-9]{3})*(?:[.,][0-9]{1,2})?)\s*(грн|₴|uah|usd|\$|€|eur|руб|₽)", full_text, flags=re.I)
@@ -679,7 +682,6 @@ def parse_product(req: ParseRequest):
                 if m2:
                     cp = clean_price_text(m2.group(0))
                     if cp:
-                        # якщо дуже мале число і немає валюти поруч -- не беремо
                         num = float(cp)
                         surrounding = full_text[max(0, m2.start()-40):m2.end()+40]
                         if num < 20 and not contains_currency(surrounding):
@@ -687,13 +689,11 @@ def parse_product(req: ParseRequest):
                         else:
                             currentPrice = cp
 
-        # останні установки
         name = name or "Невідома назва"
         currentPrice = currentPrice or "Невідома ціна"
         oldPrice = oldPrice or None
         inStock = bool(inStock if inStock is not None else (currentPrice and currentPrice != "Невідома ціна"))
 
-        # debug — корисно для діагностики (видаліть у продакшн)
         print("parse_product debug:", {"url": url, "name": name, "currentPrice": currentPrice, "oldPrice": oldPrice, "inStock": inStock})
 
         return ParseResponse(name=name, currentPrice=currentPrice, oldPrice=oldPrice, inStock=inStock)
