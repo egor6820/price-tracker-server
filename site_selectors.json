@@ -1,0 +1,35 @@
+{
+"rozetka.com.ua": {
+  "name": [
+    "h1.title__font",
+    "h1[class*='title__font']",
+    "h1.product__title",
+    "[itemprop='name']"
+  ],
+  "price": [
+    "p.product-price__big",
+    "p[class*='product-price__big']",
+    ".product-price__big",
+    "p.product-price__main",
+    "[itemprop='price']",
+    "meta[property='product:price:amount']"
+  ],
+  "old_price": [
+    "p.product-price__small",
+    "p[class*='product-price__small']",
+    ".product-price__small",
+    ".product-price__old",
+    ".product-old-price"
+  ],
+  "in_stock_text": [
+    "немає в наявності",
+    "відсутній",
+    "закінчився",
+    "є в наявності",
+    "в наявності"
+  ]
+}
+
+
+
+}
