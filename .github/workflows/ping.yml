@@ -2,7 +2,7 @@ name: Keep Render Alive
 
 on:
   schedule:
-    - cron: "*/10 * * * *"  # кожні 10 хвилин (UTC)
+    - cron: "*/14 * * * *"  # кожні 14 хвилин (UTC)
   workflow_dispatch:       # ручний запуск
 
 jobs:
