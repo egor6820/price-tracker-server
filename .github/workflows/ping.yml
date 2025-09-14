@@ -1,0 +1,15 @@
+name: Keep Render Alive
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"  # кожні 10 хвилин (UTC)
+  workflow_dispatch:       # ручний запуск
+
+jobs:
+  ping-server:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Ping Render server
+        run: |
+          curl -s https://price-tracker-server-q09i.onrender.com/ping || echo "Server offline"
