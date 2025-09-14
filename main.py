@@ -17,8 +17,9 @@ app = FastAPI()
 
 # --- Health check endpoint для UptimeRobot / Render ---
 @app.get("/")
-def health_check():
+def root():
     return {"status": "ok"}
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -708,4 +709,5 @@ def parse_product(req: ParseRequest):
         print("Error in parse_product:", e)
         traceback.print_exc()
         return ParseResponse(name="Невідома назва", currentPrice="Невідома ціна", oldPrice=None, inStock=False)
+
 
