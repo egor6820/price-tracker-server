@@ -540,6 +540,42 @@ def extract_with_playwright_direct(url: str, domain_cfg: dict | None = None, wai
                 pass
             raise last_exc
 
+# ---- Robust fetch: multiple playwright attempts then requests fallback ----
+def robust_fetch_html(url: str, domain_cfg: dict | None = None, playwright_attempts: int = 2, requests_attempts: int = 3):
+    """
+    Спробує playwright кілька разів (щоб дочекатися рендеру JS),
+    якщо не вдалось або html "малий" — fallback на requests (кілька спроб).
+    Повертає tuple: (html_string, extracted_dict_or_empty)
+    """
+    # 1) Playwright attempts
+    for attempt in range(playwright_attempts):
+        try:
+            extracted = extract_with_playwright_direct(url, domain_cfg=domain_cfg, wait_for_price_sec=20)
+            html = extracted.get("html") or ""
+            # якщо html достатньо великий — беремо
+            if html and len(html) > 200:
+                return html, extracted
+            # якщо html малий — даємо ще спробу після невеликої паузи
+        except Exception as e:
+            print(f"Playwright attempt {attempt+1} failed: {e}")
+        time.sleep(0.8 * (attempt+1))
+
+    # 2) fallback to requests (several attempts)
+    last_exc = None
+    for i in range(requests_attempts):
+        try:
+            html = parse_using_requests(url, timeout=25)
+            if html and len(html) > 100:
+                return html, {}
+        except Exception as e:
+            last_exc = e
+        time.sleep(0.8 * (i+1))
+
+    # якщо нічого не повернулося, піднімемо останню помилку (вище буде обробка)
+    if last_exc:
+        raise last_exc
+    return "", {}
+
 # ---- Fallback requests ----
 def parse_using_requests(url: str, timeout: int = 25):
     headers = {
@@ -567,31 +603,36 @@ def parse_product(req: ParseRequest):
         html = ""
 
         dynamic_domains = ["rozetka.com.ua", "aliexpress.com", "allo.ua"]
-        if domain_cfg or any(d in url for d in dynamic_domains):
+
+        # --- robust fetch: спробуємо playwright кілька разів, потім requests ---
+        try:
+            html, extracted = robust_fetch_html(url, domain_cfg=domain_cfg)
+        except Exception as e:
+            print("robust_fetch_html failed:", e)
+            # остання спроба через requests
             try:
-                extracted = extract_with_playwright_direct(url, domain_cfg=domain_cfg, wait_for_price_sec=25)
-                html = extracted.get("html") or ""
-                if extracted.get("name"):
-                    cand = extracted["name"].strip()
-                    if is_valid_name_candidate(cand):
-                        name = cand
-                if extracted.get("price_text"):
-                    cp = clean_price_text(extracted["price_text"])
-                    if cp:
-                        if contains_currency(extracted["price_text"]) or float(cp) >= 20:
-                            currentPrice = cp
-                        else:
-                            # якщо селектор домену явно price — можна дозволити, але зараз ми консервативні
-                            pass
-                if extracted.get("old_price_text"):
-                    op = clean_price_text(extracted["old_price_text"])
-                    if op:
-                        oldPrice = op
-            except Exception as e:
-                print("Playwright failed, falling back to requests:", e)
                 html = parse_using_requests(url, timeout=30)
-        else:
-            html = parse_using_requests(url, timeout=30)
+                extracted = {}
+            except Exception as e2:
+                print("final requests fallback failed:", e2)
+                html = ""
+                extracted = {}
+
+        # Якщо playwright повернув щось в extracted — підхоплюємо name/price/old
+        if isinstance(extracted, dict) and extracted:
+            if extracted.get("name"):
+                cand = extracted["name"].strip()
+                if is_valid_name_candidate(cand):
+                    name = cand
+            if extracted.get("price_text"):
+                cp = clean_price_text(extracted["price_text"])
+                if cp:
+                    if contains_currency(extracted["price_text"]) or float(cp) >= 20:
+                        currentPrice = cp
+            if extracted.get("old_price_text"):
+                op = clean_price_text(extracted["old_price_text"])
+                if op:
+                    oldPrice = op
 
         if not html and not (name or currentPrice):
             return ParseResponse(name="Помилка завантаження", currentPrice="Помилка", oldPrice=None, inStock=False)
@@ -708,7 +749,3 @@ def parse_product(req: ParseRequest):
         print("Error in parse_product:", e)
         traceback.print_exc()
         return ParseResponse(name="Невідома назва", currentPrice="Невідома ціна", oldPrice=None, inStock=False)
-
-
-
-
