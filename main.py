@@ -5,8 +5,8 @@ import re
 import json
 import traceback
 import functools
-from typing import Optional, Tuple
 from threading import Semaphore
+from typing import Optional, Tuple
 
 import requests
 from bs4 import BeautifulSoup, Tag
@@ -14,25 +14,17 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
-
-# Playwright sync API (we will start browser once in a thread and use run_in_threadpool)
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 # ---- Config ----
 SELECTORS_FILE = "site_selectors.json"
 PLAYWRIGHT_ENABLED = os.getenv("ENABLE_PLAYWRIGHT", "true").lower() in ("1", "true", "yes")
-# limit parallel playwright usages (1 on free Render is safest)
 PLAYWRIGHT_MAX_PARALLEL = int(os.getenv("PLAYWRIGHT_MAX_PARALLEL", "1"))
-# how many Playwright attempts per URL
 PLAYWRIGHT_ATTEMPTS = int(os.getenv("PLAYWRIGHT_ATTEMPTS", "2"))
 
 app = FastAPI()
 
-# --- Health check endpoint для UptimeRobot / Render ---
-@app.get("/ping")
-def ping():
-    return {"status": "ok"}
-
+# CORS для мобільного застосунку
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -40,6 +32,12 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
+# Health check
+@app.get("/ping")
+def ping():
+    return {"status": "ok"}
+
+# ---- Models ----
 class ParseRequest(BaseModel):
     url: str
 
@@ -56,7 +54,7 @@ try:
 except Exception:
     SITE_SELECTORS = {}
 
-# --- (your existing default selectors) ---
+# Default Rozetka selectors
 SITE_SELECTORS.setdefault("rozetka.com.ua", {
     "name": [
         "h1.title__font",
@@ -88,17 +86,11 @@ SITE_SELECTORS.setdefault("rozetka.com.ua", {
     ]
 })
 
-# -------------------------
-#  (KEEP your helper functions)
-#  I preserved all your clean_price_text, heuristics, find_best_price, etc.
-#  For brevity I paste them here exactly as in your original code (unchanged).
-# -------------------------
-
+# ---- Helpers ----
 PLACEHOLDER_KEYWORDS = [
-    "зачекайте", "трохи", "завантаж", "loading", "please wait", "очікуйте", "завантаження",
-    "loading...", "завантажу", "шукаємо", "будь ласка зачекайте", "будь ласка, зачекайте"
+    "зачекайте", "трохи", "завантаж", "loading", "please wait",
+    "очікуйте", "завантаження", "loading...", "завантажу", "шукаємо"
 ]
-
 CURRENCY_KEYWORDS = ['₴', 'грн', 'uah', '$', 'usd', '€', 'eur', 'руб', '₽']
 
 def contains_currency(text: Optional[str]) -> bool:
@@ -108,20 +100,16 @@ def contains_currency(text: Optional[str]) -> bool:
     for cur in CURRENCY_KEYWORDS:
         if cur in t:
             return True
-    if re.search(r"\bгрн\b|\buah\b|\busd\b|\beur\b", t):
-        return True
-    return False
+    return bool(re.search(r"\bгрн\b|\buah\b|\busd\b|\beur\b", t))
 
 def clean_price_text(text: Optional[str]) -> Optional[str]:
     if not text:
         return None
-    s = str(text).strip()
-    s = s.replace("\u00A0", " ").replace("\xa0", " ")
-    m = re.search(r"[-+]?[0-9\.\,\s\u00A0\u202F]{1,50}", s)
+    s = str(text).strip().replace("\u00A0", " ").replace("\xa0", " ")
+    m = re.search(r"[-+]?[0-9\.\,\s]{1,50}", s)
     if not m:
         return None
-    num_s = m.group(0).strip()
-    num_s = num_s.replace(" ", "")
+    num_s = m.group(0).strip().replace(" ", "")
     if ',' in num_s and '.' in num_s:
         if num_s.rfind(',') > num_s.rfind('.'):
             normalized = num_s.replace('.', '').replace(',', '.')
@@ -132,19 +120,9 @@ def clean_price_text(text: Optional[str]) -> Optional[str]:
             normalized = num_s.replace(',', '')
         else:
             normalized = num_s.replace(',', '.')
-    elif '.' in num_s:
-        if re.search(r"\.\d{3}(?!\d)", num_s):
-            normalized = num_s.replace('.', '')
-        else:
-            normalized = num_s
     else:
         normalized = num_s
     normalized = re.sub(r"[^\d\.\-+]", "", normalized)
-    if not normalized:
-        return None
-    if normalized.count('.') > 1:
-        parts = normalized.split('.')
-        normalized = ''.join(parts[:-1]) + '.' + parts[-1]
     try:
         val = float(normalized)
     except Exception:
@@ -154,221 +132,31 @@ def clean_price_text(text: Optional[str]) -> Optional[str]:
     if val.is_integer():
         return str(int(val))
     else:
-        sres = ("{:.2f}".format(val)).rstrip('0').rstrip('.')
-        return sres
+        return ("{:.2f}".format(val)).rstrip('0').rstrip('.')
 
 def text_has_digits_and_not_placeholder(text: Optional[str]) -> bool:
-    if not text:
+    if not text or not re.search(r"\d", text):
         return False
-    t = text.lower()
-    if not re.search(r"\d", t):
-        return False
-    for kw in PLACEHOLDER_KEYWORDS:
-        if kw in t:
-            return False
-    return True
-
-def extract_ld_json(soup: BeautifulSoup):
-    scripts = soup.find_all("script", {"type": "application/ld+json"})
-    for s in scripts:
-        try:
-            data = json.loads(s.string or "{}")
-        except Exception:
-            try:
-                text = s.string or ""
-                data = json.loads(text.strip())
-            except Exception:
-                continue
-        if isinstance(data, list):
-            for item in data:
-                if isinstance(item, dict) and item.get("@type", "").lower() in ("product", "offer"):
-                    yield item
-        elif isinstance(data, dict):
-            if data.get("@type", "").lower() in ("product", "offer") or "offers" in data:
-                yield data
-
-def price_from_ld(item):
-    offers = item.get("offers")
-    if isinstance(offers, dict):
-        price = offers.get("price") or offers.get("priceSpecification", {}).get("price")
-        currency = offers.get("priceCurrency") or (
-            offers.get("priceSpecification", {}).get("priceCurrency")
-            if isinstance(offers.get("priceSpecification"), dict)
-            else None
-        )
-        if price:
-            return str(price) + (f" {currency}" if currency else "")
-    if "price" in item:
-        return str(item["price"])
-    return None
-
-def text_contains_any(text: str, needles: list):
-    t = (text or "").lower()
-    for n in needles:
-        if n.lower() in t:
-            return True
-    return False
+    return all(kw not in text.lower() for kw in PLACEHOLDER_KEYWORDS)
 
 def tag_text_or_attr(tag: Tag) -> str:
-    if tag is None:
+    if not tag:
         return ""
     if tag.name == "meta":
         for attr in ("content", "value"):
             if tag.get(attr):
                 return str(tag.get(attr))
-        return ""
     for attr in ("data-price", "data-product-price", "content", "value", "title", "alt"):
         if tag.get(attr):
             return str(tag.get(attr))
     return tag.get_text(" ", strip=True) or ""
 
-def score_price_candidate(tag: Tag, text: str) -> int:
-    score = 0
-    t = (text or "").lower()
-    if contains_currency(t):
-        score += 200
-    cls_id = " ".join(filter(None, [(" ".join(tag.get("class")) if tag.get("class") else ""), tag.get("id") or ""]))
-    if re.search(r"(price|cost|цiн|ціна|price__|product-price|sale|amount|sum|грн|uah|price--|product__price|price-old|old-price)", cls_id, flags=re.I):
-        score += 120
-    if tag.get("itemprop") and "price" in tag.get("itemprop").lower():
-        score += 100
-    if tag.name == "meta" and tag.get("property", "").lower().find("price") != -1:
-        score += 80
-    words = len((text or "").split())
-    if words <= 4:
-        score += 10
-    if re.search(r"(відгук|reviews|rating|шт|pcs|вага|кг|грам)", t):
-        score -= 80
-    return score
-
-def find_best_price(soup: BeautifulSoup) -> Tuple[Optional[str], Optional[str], Optional[Tag]]:
-    for m in soup.find_all("meta"):
-        if m.get("property", "").lower() in ("product:price:amount", "og:price:amount"):
-            content = m.get("content", "")
-            cp = clean_price_text(content)
-            if cp:
-                return cp, None, m
-    item_price = soup.select("[itemprop='price'], [itemprop*='price']")
-    for it in item_price:
-        text = tag_text_or_attr(it)
-        cp = clean_price_text(text)
-        if cp:
-            return cp, None, it
-    candidates = []
-    for tag in soup.find_all():
-        if tag.name not in ("span","p","div","strong","b","li","a","td","em","meta"):
-            continue
-        txt = tag_text_or_attr(tag)
-        if not txt:
-            continue
-        if not re.search(r"\d", txt):
-            continue
-        cp = clean_price_text(txt)
-        if not cp:
-            continue
-        sc = score_price_candidate(tag, txt)
-        candidates.append((tag, txt, cp, sc))
-    if candidates:
-        candidates_sorted = sorted(candidates, key=lambda x: x[3], reverse=True)
-        for best_tag, best_text, best_cp, best_score in candidates_sorted:
-            try:
-                num = float(best_cp)
-            except:
-                num = None
-            has_currency = contains_currency(best_text) or contains_currency(tag_text_or_attr(best_tag))
-            cls_id = " ".join(filter(None, [(" ".join(best_tag.get("class")) if best_tag.get("class") else ""), best_tag.get("id") or ""]))
-            has_price_class = bool(re.search(r"(price|product-price|price__|цiн|ціна|грн|uah|cost|amount|sum|sale|old-price)", cls_id, flags=re.I))
-            if not has_currency:
-                if num is not None and num < 20 and not has_price_class:
-                    continue
-            old_price = None
-            parent = best_tag.parent
-            if parent:
-                for child in parent.find_all():
-                    if child == best_tag:
-                        continue
-                    ch_txt = tag_text_or_attr(child)
-                    if not ch_txt or not re.search(r"\d", ch_txt):
-                        continue
-                    op = clean_price_text(ch_txt)
-                    if op and op != best_cp:
-                        old_price = op
-                        break
-            return best_cp, old_price, best_tag
-    full_text = soup.get_text(" ", strip=True)
-    m = re.search(r"([0-9]{1,3}(?:[ \u00A0][0-9]{3})*(?:[.,][0-9]{1,2})?)\s*(грн|₴|uah|usd|\$|€|eur|руб|₽)", full_text, flags=re.I)
-    if m:
-        cp = clean_price_text(m.group(1))
-        if cp:
-            return cp, None, None
-    m2 = re.search(r"([0-9]{1,3}(?:[ \u00A0][0-9]{3})*(?:[.,][0-9]{1,2})?)", full_text)
-    if m2:
-        cp = clean_price_text(m2.group(1))
-        if cp:
-            num = float(cp)
-            surrounding = full_text[max(0, m2.start()-40):m2.end()+40]
-            if num < 20 and not contains_currency(surrounding):
-                return None, None, None
-            return cp, None, None
-    return None, None, None
-
-def find_best_name(soup: BeautifulSoup, price_tag: Optional[Tag] = None) -> Optional[str]:
-    og = soup.find("meta", property="og:title")
-    if og and og.get("content"):
-        t = og.get("content").strip()
-        if is_valid_name_candidate(t):
-            return t
-    tw = soup.find("meta", attrs={"name":"twitter:title"})
-    if tw and tw.get("content"):
-        t = tw.get("content").strip()
-        if is_valid_name_candidate(t):
-            return t
-    meta_title = soup.find("meta", attrs={"name":"title"})
-    if meta_title and meta_title.get("content"):
-        t = meta_title.get("content").strip()
-        if is_valid_name_candidate(t):
-            return t
-    title_tag = soup.find("title")
-    if title_tag and title_tag.string:
-        t = title_tag.string.strip()
-        t = re.split(r"[\|\-—:]", t)[0].strip()
-        if is_valid_name_candidate(t):
-            return t
-    item_name = soup.select("[itemprop='name'], [itemprop*='name']")
-    for it in item_name:
-        txt = tag_text_or_attr(it)
-        if txt and is_valid_name_candidate(txt):
-            return txt
-    for h in soup.find_all(["h1","h2","h3"]):
-        t = h.get_text(" ", strip=True)
-        if t and is_valid_name_candidate(t):
-            return t
-    candidates = []
-    for tag in soup.find_all(True, class_=re.compile(r"(title|product|name|goods|item)", flags=re.I)):
-        txt = tag_text_or_attr(tag)
-        if txt and is_valid_name_candidate(txt):
-            candidates.append(txt)
-    if candidates:
-        candidates_sorted = sorted(candidates, key=lambda x: len(x))
-        return candidates_sorted[0]
-    if price_tag:
-        nearby = find_nearby_name(price_tag)
-        if nearby and is_valid_name_candidate(nearby):
-            return nearby
-    lines = [l.strip() for l in re.split(r"\n+", soup.get_text()) if l.strip()]
-    for l in lines:
-        if len(l) > 4 and len(l.split()) < 25 and is_valid_name_candidate(l):
-            return l.strip()
-    return None
-
 def is_valid_name_candidate(text: Optional[str]) -> bool:
     if not text:
         return False
-    t = text.strip()
-    low = t.lower()
-    for kw in PLACEHOLDER_KEYWORDS:
-        if kw in low:
-            return False
+    t = text.strip().lower()
+    if any(kw in t for kw in PLACEHOLDER_KEYWORDS):
+        return False
     if re.match(r"^[\.\-\,\s]+$", t):
         return False
     if re.search(r"\.{3,}", t):
@@ -377,67 +165,33 @@ def is_valid_name_candidate(text: Optional[str]) -> bool:
         return False
     return True
 
-def find_nearby_name(price_tag: Tag) -> Optional[str]:
-    if not price_tag:
-        return None
-    node = price_tag
-    for _ in range(4):
-        node = node.parent
-        if not node:
-            break
-        for h in node.find_all(["h1","h2","h3"]):
-            txt = h.get_text(" ", strip=True)
-            if is_valid_name_candidate(txt):
-                return txt
-        t = node.find(True, class_=re.compile(r"(title|product|name|goods|item)", flags=re.I))
-        if t:
-            txt = tag_text_or_attr(t)
-            if is_valid_name_candidate(txt):
-                return txt
-    return None
-
-# -------------------------
-#  Playwright: persistent browser + semaphore + threadpool usage
-# -------------------------
-
+# ---- Playwright setup ----
 @app.on_event("startup")
 async def startup_playwright():
-    """
-    Start Playwright once in a thread pool, create a browser instance and a Semaphore.
-    If it fails (likely due to lack of memory on free Render), we set browser None
-    and later fall back to requests.
-    """
     app.state.play = None
     app.state.browser = None
     app.state.play_semaphore = None
-
     if not PLAYWRIGHT_ENABLED:
         print("Playwright disabled by ENV")
         return
-
     def _start():
-        try:
-            p = sync_playwright().start()
-            browser = p.chromium.launch(headless=True, args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--single-process"
-            ])
-            return (p, browser)
-        except Exception as e:
-            # bubble up
-            raise
-
+        p = sync_playwright().start()
+        browser = p.chromium.launch(headless=True, args=[
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--single-process"
+        ])
+        return p, browser
     try:
         p, browser = await run_in_threadpool(_start)
         app.state.play = p
         app.state.browser = browser
-        app.state.play_semaphore = Semaphore(max(1, PLAYWRIGHT_MAX_PARALLEL))
+        app.state.play_semaphore = Semaphore(PLAYWRIGHT_MAX_PARALLEL)
         print("Playwright started; semaphore size =", PLAYWRIGHT_MAX_PARALLEL)
     except Exception as e:
-        print("Playwright startup failed (will use requests fallback):", e)
+        print("Playwright startup failed:", e)
         traceback.print_exc()
         app.state.play = None
         app.state.browser = None
@@ -445,165 +199,103 @@ async def startup_playwright():
 
 @app.on_event("shutdown")
 async def shutdown_playwright():
-    """
-    Gracefully close browser and stop playwright in threadpool.
-    """
     def _stop(p, browser):
         try:
             if browser:
                 browser.close()
-        except Exception:
-            pass
+        except: pass
         try:
             if p:
                 p.stop()
-        except Exception:
-            pass
-
+        except: pass
     p = getattr(app.state, "play", None)
     browser = getattr(app.state, "browser", None)
     if p or browser:
-        try:
-            await run_in_threadpool(functools.partial(_stop, p, browser))
-            print("Playwright stopped.")
-        except Exception as e:
-            print("Error stopping Playwright:", e)
-            traceback.print_exc()
+        await run_in_threadpool(functools.partial(_stop, p, browser))
+        print("Playwright stopped.")
 
-def _extract_using_browser_blocking(browser, url: str, domain_cfg: dict | None = None, wait_for_price_sec: int = 25):
-    """
-    Blocking worker: executed in threadpool. Uses provided browser object (NOT closing it).
-    Creates a fresh context+page per request and closes them.
-    """
+# ---- Browser extraction ----
+def _extract_using_browser_blocking(browser, url: str, domain_cfg: dict | None = None, wait_for_price_sec: int = 20):
     result = {"name": None, "price_text": None, "old_price_text": None, "html": None}
-    ctx = None
-    page = None
+    ctx, page = None, None
     try:
         ctx = browser.new_context()
         page = ctx.new_page()
         page.set_extra_http_headers({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
             "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
         })
-        page.goto(url, timeout=140000)
-        try:
-            page.wait_for_load_state('networkidle', timeout=70000)
-        except PlaywrightTimeout:
-            pass
-        # small pause for dynamic blocks
+        page.goto(url, timeout=60000)
+        try: page.wait_for_load_state('networkidle', timeout=30000)
+        except PlaywrightTimeout: pass
         page.wait_for_timeout(500)
-
+        # domain-specific selectors
         if domain_cfg:
-            # name (wait loop)
+            # name
             for sel in domain_cfg.get("name", []):
-                try:
-                    el = page.locator(sel).first
-                    if el.count() == 0:
-                        continue
-                    end_time = time.time() + wait_for_price_sec
-                    while time.time() < end_time:
-                        try:
-                            txt = el.inner_text(timeout=2000).strip()
-                        except Exception:
-                            txt = ""
-                        if txt and all(kw not in txt.lower() for kw in PLACEHOLDER_KEYWORDS):
-                            result["name"] = txt
-                            break
-                        time.sleep(0.4)
-                    if result["name"]:
+                el = page.locator(sel).first
+                if el.count() == 0: continue
+                end_time = time.time() + wait_for_price_sec
+                while time.time() < end_time:
+                    try:
+                        txt = el.inner_text(timeout=2000).strip()
+                    except: txt = ""
+                    if txt and text_has_digits_and_not_placeholder(txt) is False:
+                        result["name"] = txt
                         break
-                except Exception:
-                    continue
-
+                    time.sleep(0.3)
+                if result["name"]: break
             # price
             for sel in domain_cfg.get("price", []):
-                try:
-                    if sel.startswith("meta"):
-                        meta = page.query_selector(sel)
-                        if meta:
-                            content = meta.get_attribute("content")
-                            if content and clean_price_text(content):
-                                result["price_text"] = content.strip()
-                                break
-                        continue
-                    el = page.locator(sel).first
-                    if el.count() == 0:
-                        continue
-                    end_time = time.time() + wait_for_price_sec
-                    while time.time() < end_time:
-                        try:
-                            txt = el.inner_text(timeout=2000).strip()
-                        except Exception:
-                            txt = ""
-                        if text_has_digits_and_not_placeholder(txt):
-                            result["price_text"] = txt
-                            break
-                        time.sleep(0.4)
-                    if result["price_text"]:
+                el = page.locator(sel).first
+                if el.count() == 0: continue
+                end_time = time.time() + wait_for_price_sec
+                while time.time() < end_time:
+                    try:
+                        txt = el.inner_text(timeout=2000).strip()
+                    except: txt = ""
+                    if text_has_digits_and_not_placeholder(txt):
+                        result["price_text"] = txt
                         break
-                except Exception:
-                    continue
-
+                    time.sleep(0.3)
+                if result["price_text"]: break
             # old price
             for sel in domain_cfg.get("old_price", []):
-                try:
-                    el = page.locator(sel).first
-                    if el.count() > 0:
-                        txt = el.inner_text(timeout=2000).strip()
-                        if text_has_digits_and_not_placeholder(txt):
-                            result["old_price_text"] = txt
-                            break
-                except Exception:
-                    continue
-
+                el = page.locator(sel).first
+                if el.count() > 0:
+                    txt = el.inner_text(timeout=2000).strip()
+                    if text_has_digits_and_not_placeholder(txt):
+                        result["old_price_text"] = txt
+                        break
         result["html"] = page.content()
         return result
-
-    except Exception as e:
-        traceback.print_exc()
-        raise
     finally:
-        try:
-            if page:
-                page.close()
-        except Exception:
-            pass
-        try:
-            if ctx:
-                ctx.close()
-        except Exception:
-            pass
+        if page: page.close()
+        if ctx: ctx.close()
 
-async def extract_with_playwright_direct(url: str, domain_cfg: dict | None = None, wait_for_price_sec: int = 25):
-    """
-    Async wrapper: acquire semaphore, run blocking Playwright extraction in threadpool, release semaphore.
-    """
+async def extract_with_playwright_direct(url: str, domain_cfg: dict | None = None, wait_for_price_sec: int = 20):
     browser = getattr(app.state, "browser", None)
     sem = getattr(app.state, "play_semaphore", None)
-
     if not browser:
-        # Playwright unavailable (startup failed) -> signal to caller
         raise RuntimeError("Playwright browser not available")
-
-    # acquire semaphore (blocking call executed in threadpool to avoid blocking event loop)
-    if sem:
-        await run_in_threadpool(sem.acquire)
-
+    if sem: await run_in_threadpool(sem.acquire)
     try:
-        # run blocking extraction in threadpool
         func = functools.partial(_extract_using_browser_blocking, browser, url, domain_cfg, wait_for_price_sec)
         return await run_in_threadpool(func)
     finally:
-        if sem:
-            # release in threadpool
-            await run_in_threadpool(sem.release)
+        if sem: await run_in_threadpool(sem.release)
 
-# ---- Robust fetch: multiple playwright attempts then requests fallback ----
-async def robust_fetch_html(url: str, domain_cfg: dict | None = None, playwright_attempts: int = PLAYWRIGHT_ATTEMPTS, requests_attempts: int = 3):
-    """
-    Try Playwright (persistent browser) a few times, then fallback to requests.
-    """
-    # Try Playwright only if enabled and browser started
+# ---- Robust fetch ----
+def parse_using_requests(url: str, timeout: int = 20):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
+    r = requests.get(url, headers=headers, timeout=timeout)
+    r.raise_for_status()
+    return r.text
+
+async def robust_fetch_html(url: str, domain_cfg: dict | None = None, playwright_attempts: int = PLAYWRIGHT_ATTEMPTS, requests_attempts: int = 2):
     if PLAYWRIGHT_ENABLED and getattr(app.state, "browser", None):
         for attempt in range(playwright_attempts):
             try:
@@ -613,35 +305,20 @@ async def robust_fetch_html(url: str, domain_cfg: dict | None = None, playwright
                     return html, extracted
             except Exception as e:
                 print(f"Playwright attempt {attempt+1} failed: {e}")
-                traceback.print_exc()
-            # wait a little between attempts
-            await run_in_threadpool(time.sleep, 0.8 * (attempt+1))
-
-    # fallback to requests (run requests in threadpool so event loop not blocked)
+            await run_in_threadpool(time.sleep, 0.5 * (attempt+1))
     last_exc = None
     for i in range(requests_attempts):
         try:
-            html = await run_in_threadpool(parse_using_requests, url, 25)
+            html = await run_in_threadpool(parse_using_requests, url, 20)
             if html and len(html) > 100:
                 return html, {}
         except Exception as e:
             last_exc = e
-        await run_in_threadpool(time.sleep, 0.8 * (i+1))
-
-    if last_exc:
-        raise last_exc
+        await run_in_threadpool(time.sleep, 0.5 * (i+1))
+    if last_exc: raise last_exc
     return "", {}
 
-def parse_using_requests(url: str, timeout: int = 25):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36",
-        "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
-    }
-    r = requests.get(url, headers=headers, timeout=timeout)
-    r.raise_for_status()
-    return r.text
-
-# ---- Endpoint ----
+# ---- Parse endpoint ----
 @app.post("/parse", response_model=ParseResponse)
 async def parse_product(req: ParseRequest):
     url = req.url
@@ -650,161 +327,40 @@ async def parse_product(req: ParseRequest):
         if domain_key in url:
             domain_cfg = cfg
             break
-
     try:
-        name = None
-        currentPrice = None
-        oldPrice = None
-        inStock = None
-        html = ""
-
-        # robust fetch (async)
-        try:
-            html, extracted = await robust_fetch_html(url, domain_cfg=domain_cfg)
-        except Exception as e:
-            print("robust_fetch_html failed:", e)
-            traceback.print_exc()
-            # final fallback to plain requests (threadpool)
-            try:
-                html = await run_in_threadpool(parse_using_requests, url, 30)
-                extracted = {}
-            except Exception as e2:
-                print("final requests fallback failed:", e2)
-                traceback.print_exc()
-                html = ""
-                extracted = {}
-
-        # If Playwright returned extracted dict, use it
-        if isinstance(extracted, dict) and extracted:
-            if extracted.get("name"):
-                cand = extracted["name"].strip()
-                if is_valid_name_candidate(cand):
-                    name = cand
-            if extracted.get("price_text"):
-                cp = clean_price_text(extracted["price_text"])
-                if cp:
-                    try:
-                        if contains_currency(extracted["price_text"]) or float(cp) >= 20:
-                            currentPrice = cp
-                    except Exception:
-                        currentPrice = cp
-            if extracted.get("old_price_text"):
-                op = clean_price_text(extracted["old_price_text"])
-                if op:
-                    oldPrice = op
-
-        if not html and not (name or currentPrice):
-            return ParseResponse(name="Помилка завантаження", currentPrice="Помилка", oldPrice=None, inStock=False)
-
-        soup = BeautifulSoup(html, "html.parser")
-
-        # ld+json
-        if not name or not currentPrice:
-            for item in extract_ld_json(soup):
-                if not name:
-                    cand = item.get("name") or item.get("headline")
-                    if cand and is_valid_name_candidate(cand):
-                        name = cand
-                if not currentPrice:
-                    p = price_from_ld(item)
-                    if p:
-                        cp = clean_price_text(p)
-                        if cp:
-                            currentPrice = cp
-                if not inStock:
-                    offers = item.get("offers") if isinstance(item, dict) else None
-                    if offers and isinstance(offers, dict):
-                        avail = offers.get("availability", "")
-                        if avail:
-                            inStock = not ("outofstock" in str(avail).lower() or "notavailable" in str(avail).lower())
-
-        # domain-specific selectors
-        if domain_cfg:
-            if not currentPrice:
-                for sel in domain_cfg.get("price", []):
-                    tag = soup.select_one(sel)
-                    if tag:
-                        if tag.name == "meta":
-                            cp = clean_price_text(tag.get("content", "").strip())
-                        else:
-                            cp = clean_price_text(tag.get_text(" ", strip=True))
-                        if cp:
-                            txt = tag_text_or_attr(tag)
-                            if contains_currency(txt) or float(cp) >= 20 or re.search(r"(price|product-price|грн|uah)", " ".join(filter(None, [tag.get("class") and " ".join(tag.get("class")), tag.get("id") or ""])), flags=re.I):
-                                currentPrice = cp
-                                break
-            if not name:
-                for sel in domain_cfg.get("name", []):
-                    tag = soup.select_one(sel)
-                    if tag:
-                        txt = tag.get_text(" ", strip=True)
-                        if txt and is_valid_name_candidate(txt):
-                            name = txt
-                            break
-            if not oldPrice:
-                for sel in domain_cfg.get("old_price", []):
-                    tag = soup.select_one(sel)
-                    if tag:
-                        txt = tag.get_text(" ", strip=True)
-                        op = clean_price_text(txt)
-                        if op:
-                            oldPrice = op
-                            break
-
-        # powerful fallbacks
-        price_tag = None
-        if not currentPrice:
-            cp, op, ptag = find_best_price(soup)
+        html, extracted = await robust_fetch_html(url, domain_cfg)
+        name, currentPrice, oldPrice, inStock = None, None, None, True
+        if extracted.get("name"):
+            cand = extracted["name"].strip()
+            if is_valid_name_candidate(cand):
+                name = cand
+        if extracted.get("price_text"):
+            cp = clean_price_text(extracted["price_text"])
             if cp:
                 currentPrice = cp
-                price_tag = ptag
-            if op and not oldPrice:
+        if extracted.get("old_price_text"):
+            op = clean_price_text(extracted["old_price_text"])
+            if op:
                 oldPrice = op
-
-        if not name:
-            name_try = find_best_name(soup, price_tag=price_tag)
-            if name_try:
-                name = name_try
-
-        if not name:
-            candidates = []
-            for sel in ["[class*='title']", "[class*='product']", "[id*='title']", "[id*='product']", "[class*='name']"]:
-                for tag in soup.select(sel):
-                    txt = tag_text_or_attr(tag)
-                    if txt and is_valid_name_candidate(txt):
-                        candidates.append(txt)
-            if candidates:
-                name = sorted(candidates, key=lambda x: len(x))[0]
-
+        soup = BeautifulSoup(html, "html.parser")
+        # fallback: universal search
         if not currentPrice:
-            full_text = soup.get_text(" ", strip=True)
-            m = re.search(r"([0-9]{1,3}(?:[ \u00A0][0-9]{3})*(?:[.,][0-9]{1,2})?)\s*(грн|₴|uah|usd|\$|€|eur|руб|₽)", full_text, flags=re.I)
-            if m:
-                cp = clean_price_text(m.group(1))
-                if cp:
-                    currentPrice = cp
-            else:
-                m2 = re.search(r"[0-9]+(?:[ \u00A0][0-9]{3})*(?:[.,][0-9]{1,2})?", full_text)
-                if m2:
-                    cp = clean_price_text(m2.group(0))
-                    if cp:
-                        num = float(cp)
-                        surrounding = full_text[max(0, m2.start()-40):m2.end()+40]
-                        if num < 20 and not contains_currency(surrounding):
-                            currentPrice = None
-                        else:
-                            currentPrice = cp
-
+            for sel in ["[itemprop*='price']", "meta[property*='price']"]:
+                tag = soup.select_one(sel)
+                if tag:
+                    cp = clean_price_text(tag_text_or_attr(tag))
+                    if cp: currentPrice = cp; break
+        if not name:
+            for sel in ["[itemprop*='name']", "title", "h1", "h2", "h3"]:
+                tag = soup.select_one(sel)
+                if tag:
+                    txt = tag_text_or_attr(tag)
+                    if is_valid_name_candidate(txt):
+                        name = txt
+                        break
         name = name or "Невідома назва"
         currentPrice = currentPrice or "Невідома ціна"
-        oldPrice = oldPrice or None
-        inStock = bool(inStock if inStock is not None else (currentPrice and currentPrice != "Невідома ціна"))
-
-        # single debug line per request
-        print("parse_product debug:", {"url": url, "name": name, "currentPrice": currentPrice, "oldPrice": oldPrice, "inStock": inStock})
-
         return ParseResponse(name=name, currentPrice=currentPrice, oldPrice=oldPrice, inStock=inStock)
-
     except Exception as e:
         print("Error in parse_product:", e)
         traceback.print_exc()
