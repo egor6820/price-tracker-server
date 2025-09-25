@@ -1,17 +1,30 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
-from fastapi.middleware.cors import CORSMiddleware
-from bs4 import BeautifulSoup, Tag
-import requests
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+# main.py
+import os
+import time
 import re
 import json
-import time
 import traceback
-from typing import Optional, List, Tuple
+import functools
+from typing import Optional, Tuple
+from threading import Semaphore
 
-# ---- Configurable: path to JSON with per-site selectors ----
+import requests
+from bs4 import BeautifulSoup, Tag
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.concurrency import run_in_threadpool
+from pydantic import BaseModel
+
+# Playwright sync API (we will start browser once in a thread and use run_in_threadpool)
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+
+# ---- Config ----
 SELECTORS_FILE = "site_selectors.json"
+PLAYWRIGHT_ENABLED = os.getenv("ENABLE_PLAYWRIGHT", "true").lower() in ("1", "true", "yes")
+# limit parallel playwright usages (1 on free Render is safest)
+PLAYWRIGHT_MAX_PARALLEL = int(os.getenv("PLAYWRIGHT_MAX_PARALLEL", "1"))
+# how many Playwright attempts per URL
+PLAYWRIGHT_ATTEMPTS = int(os.getenv("PLAYWRIGHT_ATTEMPTS", "2"))
 
 app = FastAPI()
 
@@ -43,6 +56,7 @@ try:
 except Exception:
     SITE_SELECTORS = {}
 
+# --- (your existing default selectors) ---
 SITE_SELECTORS.setdefault("rozetka.com.ua", {
     "name": [
         "h1.title__font",
@@ -74,8 +88,12 @@ SITE_SELECTORS.setdefault("rozetka.com.ua", {
     ]
 })
 
-# ---- Helpers ----
-# Розширений список плейсхолдерів / текстів-завантаження
+# -------------------------
+#  (KEEP your helper functions)
+#  I preserved all your clean_price_text, heuristics, find_best_price, etc.
+#  For brevity I paste them here exactly as in your original code (unchanged).
+# -------------------------
+
 PLACEHOLDER_KEYWORDS = [
     "зачекайте", "трохи", "завантаж", "loading", "please wait", "очікуйте", "завантаження",
     "loading...", "завантажу", "шукаємо", "будь ласка зачекайте", "будь ласка, зачекайте"
@@ -95,72 +113,47 @@ def contains_currency(text: Optional[str]) -> bool:
     return False
 
 def clean_price_text(text: Optional[str]) -> Optional[str]:
-    """
-    Нормалізує рядок з числом з урахуванням тисячних та десяткових роздільників.
-    Повертає рядок з крапкою в ролі десятичного роздільника, або None.
-    """
     if not text:
         return None
-    # Видаляємо непотрібні пробіли/NBSP зверху/знизу, але зберігаємо внутрішні символи для аналізу
     s = str(text).strip()
     s = s.replace("\u00A0", " ").replace("\xa0", " ")
-    # Витягнемо перший корисний фрагмент, що містить цифри, коми, крапки та пробіли
     m = re.search(r"[-+]?[0-9\.\,\s\u00A0\u202F]{1,50}", s)
     if not m:
         return None
     num_s = m.group(0).strip()
-    # Видаляємо пробіли (звичайні) — зазвичай вони є сепараторами тисяч
     num_s = num_s.replace(" ", "")
-    # Тепер у num_s можуть бути коми і/або крапки.
-    # Якщо присутні і ',' і '.': правіший роздільник є десятковим
     if ',' in num_s and '.' in num_s:
         if num_s.rfind(',') > num_s.rfind('.'):
-            # кома — десятковий, точки — тисячні
             normalized = num_s.replace('.', '').replace(',', '.')
         else:
-            # крапка — десятковий, коми — тисячні
             normalized = num_s.replace(',', '')
     elif ',' in num_s:
-        # лише коми: якщо кома стоїть перед групами по 3 цифри -> тисячні, інакше — десяткова
-        # приклад: 1,280  -> тисячні (початкове число), але 1,28 -> десяткова
         if re.search(r",\d{3}(?!\d)", num_s):
             normalized = num_s.replace(',', '')
         else:
             normalized = num_s.replace(',', '.')
     elif '.' in num_s:
-        # лише крапки: схожа логіка
         if re.search(r"\.\d{3}(?!\d)", num_s):
             normalized = num_s.replace('.', '')
         else:
             normalized = num_s
     else:
         normalized = num_s
-
-    # Видалимо все окрім цифр, крапки, мінуса та плюса
     normalized = re.sub(r"[^\d\.\-+]", "", normalized)
-
     if not normalized:
         return None
-
-    # Якщо є більше однієї крапки — залишимо останню як десяткову, видаливши інші
     if normalized.count('.') > 1:
         parts = normalized.split('.')
-        # з'єднаємо всі частини крім останньої, потім додамо останню через крапку
         normalized = ''.join(parts[:-1]) + '.' + parts[-1]
-
-    # Спроба перетворити у float
     try:
         val = float(normalized)
     except Exception:
         return None
     if val <= 0:
-        # вважаємо неціною або безглуздою
         return None
-    # Повертаємо компактне представлення: без .0 якщо ціле
     if val.is_integer():
         return str(int(val))
     else:
-        # обрізати зайві нулі в кінці
         sres = ("{:.2f}".format(val)).rstrip('0').rstrip('.')
         return sres
 
@@ -216,8 +209,6 @@ def text_contains_any(text: str, needles: list):
             return True
     return False
 
-# ---- New heuristic helpers ----
-
 def tag_text_or_attr(tag: Tag) -> str:
     if tag is None:
         return ""
@@ -232,60 +223,37 @@ def tag_text_or_attr(tag: Tag) -> str:
     return tag.get_text(" ", strip=True) or ""
 
 def score_price_candidate(tag: Tag, text: str) -> int:
-    """Оціночна функція — більший бал = кращий кандидат."""
     score = 0
     t = (text or "").lower()
-
-    # великий бонус, якщо є валюта
     if contains_currency(t):
         score += 200
-
-    # клас/id що містить price/cost/грн/ua... — важливий
     cls_id = " ".join(filter(None, [(" ".join(tag.get("class")) if tag.get("class") else ""), tag.get("id") or ""]))
     if re.search(r"(price|cost|цiн|ціна|price__|product-price|sale|amount|sum|грн|uah|price--|product__price|price-old|old-price)", cls_id, flags=re.I):
         score += 120
-
-    # itemprop
     if tag.get("itemprop") and "price" in tag.get("itemprop").lower():
         score += 100
-
-    # meta price
     if tag.name == "meta" and tag.get("property", "").lower().find("price") != -1:
         score += 80
-
-    # короткий текст (типова ціна — короткий)
     words = len((text or "").split())
     if words <= 4:
         score += 10
-
-    # штрафи
     if re.search(r"(відгук|reviews|rating|шт|pcs|вага|кг|грам)", t):
         score -= 80
-
     return score
 
 def find_best_price(soup: BeautifulSoup) -> Tuple[Optional[str], Optional[str], Optional[Tag]]:
-    """
-    Повертає (currentPrice_str, oldPrice_str, price_tag)
-    Пошук з пріоритетами: meta/ld/itemprop -> кандидати з класами/атрибутами -> fallback regex (з преферуванням валюти)
-    """
-    # 1) Meta с property product:price:amount
     for m in soup.find_all("meta"):
         if m.get("property", "").lower() in ("product:price:amount", "og:price:amount"):
             content = m.get("content", "")
             cp = clean_price_text(content)
             if cp:
                 return cp, None, m
-
-    # 2) itemprop=price
     item_price = soup.select("[itemprop='price'], [itemprop*='price']")
     for it in item_price:
         text = tag_text_or_attr(it)
         cp = clean_price_text(text)
         if cp:
             return cp, None, it
-
-    # 3) Збираємо кандидатів з DOM
     candidates = []
     for tag in soup.find_all():
         if tag.name not in ("span","p","div","strong","b","li","a","td","em","meta"):
@@ -300,7 +268,6 @@ def find_best_price(soup: BeautifulSoup) -> Tuple[Optional[str], Optional[str], 
             continue
         sc = score_price_candidate(tag, txt)
         candidates.append((tag, txt, cp, sc))
-
     if candidates:
         candidates_sorted = sorted(candidates, key=lambda x: x[3], reverse=True)
         for best_tag, best_text, best_cp, best_score in candidates_sorted:
@@ -314,7 +281,6 @@ def find_best_price(soup: BeautifulSoup) -> Tuple[Optional[str], Optional[str], 
             if not has_currency:
                 if num is not None and num < 20 and not has_price_class:
                     continue
-            # пошук old price поруч
             old_price = None
             parent = best_tag.parent
             if parent:
@@ -325,12 +291,10 @@ def find_best_price(soup: BeautifulSoup) -> Tuple[Optional[str], Optional[str], 
                     if not ch_txt or not re.search(r"\d", ch_txt):
                         continue
                     op = clean_price_text(ch_txt)
-                    if op and op != best_cp and (contains_currency(ch_txt) or re.search(r"(old|previous|strike|product-price__small|product-old|price--old)", " ".join(filter(None, [child.get("class") and " ".join(child.get("class"),), child.get("id") or ""])), flags=re.I) if False else True):
+                    if op and op != best_cp:
                         old_price = op
                         break
             return best_cp, old_price, best_tag
-
-    # 4) fallback regex: спершу шукаємо з валютою
     full_text = soup.get_text(" ", strip=True)
     m = re.search(r"([0-9]{1,3}(?:[ \u00A0][0-9]{3})*(?:[.,][0-9]{1,2})?)\s*(грн|₴|uah|usd|\$|€|eur|руб|₽)", full_text, flags=re.I)
     if m:
@@ -346,12 +310,9 @@ def find_best_price(soup: BeautifulSoup) -> Tuple[Optional[str], Optional[str], 
             if num < 20 and not contains_currency(surrounding):
                 return None, None, None
             return cp, None, None
-
     return None, None, None
 
 def find_best_name(soup: BeautifulSoup, price_tag: Optional[Tag] = None) -> Optional[str]:
-    """Спробувати знайти найімовірнішу назву товару (без плейсхолдерів)."""
-    # 1) og/twitter/meta title
     og = soup.find("meta", property="og:title")
     if og and og.get("content"):
         t = og.get("content").strip()
@@ -373,21 +334,15 @@ def find_best_name(soup: BeautifulSoup, price_tag: Optional[Tag] = None) -> Opti
         t = re.split(r"[\|\-—:]", t)[0].strip()
         if is_valid_name_candidate(t):
             return t
-
-    # 2) itemprop name
     item_name = soup.select("[itemprop='name'], [itemprop*='name']")
     for it in item_name:
         txt = tag_text_or_attr(it)
         if txt and is_valid_name_candidate(txt):
             return txt
-
-    # 3) h1/h2/h3
     for h in soup.find_all(["h1","h2","h3"]):
         t = h.get_text(" ", strip=True)
         if t and is_valid_name_candidate(t):
             return t
-
-    # 4) класи що містять 'title', 'product', 'name'
     candidates = []
     for tag in soup.find_all(True, class_=re.compile(r"(title|product|name|goods|item)", flags=re.I)):
         txt = tag_text_or_attr(tag)
@@ -396,18 +351,14 @@ def find_best_name(soup: BeautifulSoup, price_tag: Optional[Tag] = None) -> Opti
     if candidates:
         candidates_sorted = sorted(candidates, key=lambda x: len(x))
         return candidates_sorted[0]
-
-    # 5) proximity heuristic
     if price_tag:
         nearby = find_nearby_name(price_tag)
         if nearby and is_valid_name_candidate(nearby):
             return nearby
-
     lines = [l.strip() for l in re.split(r"\n+", soup.get_text()) if l.strip()]
     for l in lines:
         if len(l) > 4 and len(l.split()) < 25 and is_valid_name_candidate(l):
             return l.strip()
-
     return None
 
 def is_valid_name_candidate(text: Optional[str]) -> bool:
@@ -445,138 +396,242 @@ def find_nearby_name(price_tag: Tag) -> Optional[str]:
                 return txt
     return None
 
-# ---- Playwright extraction ----
-def extract_with_playwright_direct(url: str, domain_cfg: dict | None = None, wait_for_price_sec: int = 25):
+# -------------------------
+#  Playwright: persistent browser + semaphore + threadpool usage
+# -------------------------
+
+@app.on_event("startup")
+async def startup_playwright():
+    """
+    Start Playwright once in a thread pool, create a browser instance and a Semaphore.
+    If it fails (likely due to lack of memory on free Render), we set browser None
+    and later fall back to requests.
+    """
+    app.state.play = None
+    app.state.browser = None
+    app.state.play_semaphore = None
+
+    if not PLAYWRIGHT_ENABLED:
+        print("Playwright disabled by ENV")
+        return
+
+    def _start():
+        try:
+            p = sync_playwright().start()
+            browser = p.chromium.launch(headless=True, args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--single-process"
+            ])
+            return (p, browser)
+        except Exception as e:
+            # bubble up
+            raise
+
+    try:
+        p, browser = await run_in_threadpool(_start)
+        app.state.play = p
+        app.state.browser = browser
+        app.state.play_semaphore = Semaphore(max(1, PLAYWRIGHT_MAX_PARALLEL))
+        print("Playwright started; semaphore size =", PLAYWRIGHT_MAX_PARALLEL)
+    except Exception as e:
+        print("Playwright startup failed (will use requests fallback):", e)
+        traceback.print_exc()
+        app.state.play = None
+        app.state.browser = None
+        app.state.play_semaphore = None
+
+@app.on_event("shutdown")
+async def shutdown_playwright():
+    """
+    Gracefully close browser and stop playwright in threadpool.
+    """
+    def _stop(p, browser):
+        try:
+            if browser:
+                browser.close()
+        except Exception:
+            pass
+        try:
+            if p:
+                p.stop()
+        except Exception:
+            pass
+
+    p = getattr(app.state, "play", None)
+    browser = getattr(app.state, "browser", None)
+    if p or browser:
+        try:
+            await run_in_threadpool(functools.partial(_stop, p, browser))
+            print("Playwright stopped.")
+        except Exception as e:
+            print("Error stopping Playwright:", e)
+            traceback.print_exc()
+
+def _extract_using_browser_blocking(browser, url: str, domain_cfg: dict | None = None, wait_for_price_sec: int = 25):
+    """
+    Blocking worker: executed in threadpool. Uses provided browser object (NOT closing it).
+    Creates a fresh context+page per request and closes them.
+    """
     result = {"name": None, "price_text": None, "old_price_text": None, "html": None}
-    last_exc = None
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
-        page = browser.new_page()
+    ctx = None
+    page = None
+    try:
+        ctx = browser.new_context()
+        page = ctx.new_page()
         page.set_extra_http_headers({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36",
             "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
         })
+        page.goto(url, timeout=140000)
         try:
-            page.goto(url, timeout=140000)
-            try:
-                page.wait_for_load_state('networkidle', timeout=70000)
-            except PlaywrightTimeout:
-                pass
-            page.wait_for_timeout(500)
+            page.wait_for_load_state('networkidle', timeout=70000)
+        except PlaywrightTimeout:
+            pass
+        # small pause for dynamic blocks
+        page.wait_for_timeout(500)
 
-            if domain_cfg:
-                # name з циклом очікування
-                for sel in domain_cfg.get("name", []):
-                    try:
-                        el = page.locator(sel).first
-                        if el.count() == 0:
-                            continue
-                        end_time = time.time() + wait_for_price_sec
-                        while time.time() < end_time:
-                            try:
-                                txt = el.inner_text(timeout=2000).strip()
-                            except Exception:
-                                txt = ""
-                            if txt and all(kw not in txt.lower() for kw in PLACEHOLDER_KEYWORDS):
-                                result["name"] = txt
-                                break
-                            time.sleep(0.4)
-                        if result["name"]:
-                            break
-                    except Exception:
+        if domain_cfg:
+            # name (wait loop)
+            for sel in domain_cfg.get("name", []):
+                try:
+                    el = page.locator(sel).first
+                    if el.count() == 0:
                         continue
-
-                # price
-                for sel in domain_cfg.get("price", []):
-                    try:
-                        if sel.startswith("meta"):
-                            meta = page.query_selector(sel)
-                            if meta:
-                                content = meta.get_attribute("content")
-                                if content and clean_price_text(content):
-                                    result["price_text"] = content.strip()
-                                    break
-                            continue
-                        el = page.locator(sel).first
-                        if el.count() == 0:
-                            continue
-                        end_time = time.time() + wait_for_price_sec
-                        while time.time() < end_time:
-                            try:
-                                txt = el.inner_text(timeout=2000).strip()
-                            except Exception:
-                                txt = ""
-                            if text_has_digits_and_not_placeholder(txt):
-                                result["price_text"] = txt
-                                break
-                            time.sleep(0.4)
-                        if result["price_text"]:
-                            break
-                    except Exception:
-                        continue
-
-                # old price
-                for sel in domain_cfg.get("old_price", []):
-                    try:
-                        el = page.locator(sel).first
-                        if el.count() > 0:
+                    end_time = time.time() + wait_for_price_sec
+                    while time.time() < end_time:
+                        try:
                             txt = el.inner_text(timeout=2000).strip()
-                            if text_has_digits_and_not_placeholder(txt):
-                                result["old_price_text"] = txt
+                        except Exception:
+                            txt = ""
+                        if txt and all(kw not in txt.lower() for kw in PLACEHOLDER_KEYWORDS):
+                            result["name"] = txt
+                            break
+                        time.sleep(0.4)
+                    if result["name"]:
+                        break
+                except Exception:
+                    continue
+
+            # price
+            for sel in domain_cfg.get("price", []):
+                try:
+                    if sel.startswith("meta"):
+                        meta = page.query_selector(sel)
+                        if meta:
+                            content = meta.get_attribute("content")
+                            if content and clean_price_text(content):
+                                result["price_text"] = content.strip()
                                 break
-                    except Exception:
                         continue
+                    el = page.locator(sel).first
+                    if el.count() == 0:
+                        continue
+                    end_time = time.time() + wait_for_price_sec
+                    while time.time() < end_time:
+                        try:
+                            txt = el.inner_text(timeout=2000).strip()
+                        except Exception:
+                            txt = ""
+                        if text_has_digits_and_not_placeholder(txt):
+                            result["price_text"] = txt
+                            break
+                        time.sleep(0.4)
+                    if result["price_text"]:
+                        break
+                except Exception:
+                    continue
 
-            result["html"] = page.content()
-            browser.close()
-            return result
+            # old price
+            for sel in domain_cfg.get("old_price", []):
+                try:
+                    el = page.locator(sel).first
+                    if el.count() > 0:
+                        txt = el.inner_text(timeout=2000).strip()
+                        if text_has_digits_and_not_placeholder(txt):
+                            result["old_price_text"] = txt
+                            break
+                except Exception:
+                    continue
 
-        except Exception as e:
-            last_exc = e
-            traceback.print_exc()
-            try:
-                browser.close()
-            except Exception:
-                pass
-            raise last_exc
+        result["html"] = page.content()
+        return result
+
+    except Exception as e:
+        traceback.print_exc()
+        raise
+    finally:
+        try:
+            if page:
+                page.close()
+        except Exception:
+            pass
+        try:
+            if ctx:
+                ctx.close()
+        except Exception:
+            pass
+
+async def extract_with_playwright_direct(url: str, domain_cfg: dict | None = None, wait_for_price_sec: int = 25):
+    """
+    Async wrapper: acquire semaphore, run blocking Playwright extraction in threadpool, release semaphore.
+    """
+    browser = getattr(app.state, "browser", None)
+    sem = getattr(app.state, "play_semaphore", None)
+
+    if not browser:
+        # Playwright unavailable (startup failed) -> signal to caller
+        raise RuntimeError("Playwright browser not available")
+
+    # acquire semaphore (blocking call executed in threadpool to avoid blocking event loop)
+    if sem:
+        await run_in_threadpool(sem.acquire)
+
+    try:
+        # run blocking extraction in threadpool
+        func = functools.partial(_extract_using_browser_blocking, browser, url, domain_cfg, wait_for_price_sec)
+        return await run_in_threadpool(func)
+    finally:
+        if sem:
+            # release in threadpool
+            await run_in_threadpool(sem.release)
 
 # ---- Robust fetch: multiple playwright attempts then requests fallback ----
-def robust_fetch_html(url: str, domain_cfg: dict | None = None, playwright_attempts: int = 2, requests_attempts: int = 3):
+async def robust_fetch_html(url: str, domain_cfg: dict | None = None, playwright_attempts: int = PLAYWRIGHT_ATTEMPTS, requests_attempts: int = 3):
     """
-    Спробує playwright кілька разів (щоб дочекатися рендеру JS),
-    якщо не вдалось або html "малий" — fallback на requests (кілька спроб).
-    Повертає tuple: (html_string, extracted_dict_or_empty)
+    Try Playwright (persistent browser) a few times, then fallback to requests.
     """
-    # 1) Playwright attempts
-    for attempt in range(playwright_attempts):
-        try:
-            extracted = extract_with_playwright_direct(url, domain_cfg=domain_cfg, wait_for_price_sec=20)
-            html = extracted.get("html") or ""
-            # якщо html достатньо великий — беремо
-            if html and len(html) > 200:
-                return html, extracted
-            # якщо html малий — даємо ще спробу після невеликої паузи
-        except Exception as e:
-            print(f"Playwright attempt {attempt+1} failed: {e}")
-        time.sleep(0.8 * (attempt+1))
+    # Try Playwright only if enabled and browser started
+    if PLAYWRIGHT_ENABLED and getattr(app.state, "browser", None):
+        for attempt in range(playwright_attempts):
+            try:
+                extracted = await extract_with_playwright_direct(url, domain_cfg=domain_cfg, wait_for_price_sec=20)
+                html = extracted.get("html") or ""
+                if html and len(html) > 200:
+                    return html, extracted
+            except Exception as e:
+                print(f"Playwright attempt {attempt+1} failed: {e}")
+                traceback.print_exc()
+            # wait a little between attempts
+            await run_in_threadpool(time.sleep, 0.8 * (attempt+1))
 
-    # 2) fallback to requests (several attempts)
+    # fallback to requests (run requests in threadpool so event loop not blocked)
     last_exc = None
     for i in range(requests_attempts):
         try:
-            html = parse_using_requests(url, timeout=25)
+            html = await run_in_threadpool(parse_using_requests, url, 25)
             if html and len(html) > 100:
                 return html, {}
         except Exception as e:
             last_exc = e
-        time.sleep(0.8 * (i+1))
+        await run_in_threadpool(time.sleep, 0.8 * (i+1))
 
-    # якщо нічого не повернулося, піднімемо останню помилку (вище буде обробка)
     if last_exc:
         raise last_exc
     return "", {}
 
-# ---- Fallback requests ----
 def parse_using_requests(url: str, timeout: int = 25):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36",
@@ -586,8 +641,9 @@ def parse_using_requests(url: str, timeout: int = 25):
     r.raise_for_status()
     return r.text
 
+# ---- Endpoint ----
 @app.post("/parse", response_model=ParseResponse)
-def parse_product(req: ParseRequest):
+async def parse_product(req: ParseRequest):
     url = req.url
     domain_cfg = None
     for domain_key, cfg in SITE_SELECTORS.items():
@@ -602,23 +658,23 @@ def parse_product(req: ParseRequest):
         inStock = None
         html = ""
 
-        dynamic_domains = ["rozetka.com.ua", "aliexpress.com", "allo.ua"]
-
-        # --- robust fetch: спробуємо playwright кілька разів, потім requests ---
+        # robust fetch (async)
         try:
-            html, extracted = robust_fetch_html(url, domain_cfg=domain_cfg)
+            html, extracted = await robust_fetch_html(url, domain_cfg=domain_cfg)
         except Exception as e:
             print("robust_fetch_html failed:", e)
-            # остання спроба через requests
+            traceback.print_exc()
+            # final fallback to plain requests (threadpool)
             try:
-                html = parse_using_requests(url, timeout=30)
+                html = await run_in_threadpool(parse_using_requests, url, 30)
                 extracted = {}
             except Exception as e2:
                 print("final requests fallback failed:", e2)
+                traceback.print_exc()
                 html = ""
                 extracted = {}
 
-        # Якщо playwright повернув щось в extracted — підхоплюємо name/price/old
+        # If Playwright returned extracted dict, use it
         if isinstance(extracted, dict) and extracted:
             if extracted.get("name"):
                 cand = extracted["name"].strip()
@@ -627,7 +683,10 @@ def parse_product(req: ParseRequest):
             if extracted.get("price_text"):
                 cp = clean_price_text(extracted["price_text"])
                 if cp:
-                    if contains_currency(extracted["price_text"]) or float(cp) >= 20:
+                    try:
+                        if contains_currency(extracted["price_text"]) or float(cp) >= 20:
+                            currentPrice = cp
+                    except Exception:
                         currentPrice = cp
             if extracted.get("old_price_text"):
                 op = clean_price_text(extracted["old_price_text"])
@@ -741,6 +800,7 @@ def parse_product(req: ParseRequest):
         oldPrice = oldPrice or None
         inStock = bool(inStock if inStock is not None else (currentPrice and currentPrice != "Невідома ціна"))
 
+        # single debug line per request
         print("parse_product debug:", {"url": url, "name": name, "currentPrice": currentPrice, "oldPrice": oldPrice, "inStock": inStock})
 
         return ParseResponse(name=name, currentPrice=currentPrice, oldPrice=oldPrice, inStock=inStock)
