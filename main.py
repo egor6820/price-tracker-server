@@ -1,3 +1,4 @@
+# main.py - improved for Render (requests-first, safer Playwright, heuristics, last-good cache)
 from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,7 +10,9 @@ import json
 import time
 import traceback
 import random
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
+from urllib.parse import urlparse
+from threading import Lock
 
 # ---- Configurable: path to JSON with per-site selectors ----
 SELECTORS_FILE = "site_selectors.json"
@@ -387,27 +390,112 @@ def find_nearby_name(price_tag: Tag) -> Optional[str]:
                 return txt
     return None
 
-# ---- Playwright extraction ----
-def extract_with_playwright_direct(url: str, domain_cfg: dict | None = None, wait_for_price_sec: int = 25):
+# ---- New: caches / heuristics for suspicious prices & last-good fallback ----
+LAST_GOOD_CACHE: Dict[str, Dict[str, Any]] = {}  # url -> {"ts": float, "name": str, "currentPrice": str, "oldPrice": str, "inStock": bool}
+CACHE_LOCK = Lock()
+SUSPICIOUS_PRICE_URLS: Dict[str, set] = {}  # price_str -> set(urls)
+SUSPICIOUS_THRESHOLD = 3  # if same price appears for >=3 different URLs -> suspicious
+LAST_GOOD_TTL = 7 * 24 * 3600  # seconds (7 days)
+
+def domain_from_url(url: str) -> Optional[str]:
+    try:
+        p = urlparse(url)
+        return p.netloc.lower().replace("www.", "")
+    except Exception:
+        return None
+
+def is_domain_like(text: str) -> bool:
+    if not text:
+        return False
+    text = text.strip().lower()
+    # Looks like "example.com" or "example.ua" and no spaces, short
+    return bool(re.match(r"^[a-z0-9\-]+(\.[a-z]{2,})+$", text))
+
+def record_suspicious_price(price_str: str, url: str):
+    if not price_str:
+        return
+    urls = SUSPICIOUS_PRICE_URLS.setdefault(price_str, set())
+    urls.add(url)
+
+def price_marked_globally_suspicious(price_str: str) -> bool:
+    urls = SUSPICIOUS_PRICE_URLS.get(price_str)
+    return urls is not None and len(urls) >= SUSPICIOUS_THRESHOLD
+
+def is_suspect_result(url: str, name: Optional[str], price_text: Optional[str], html_snippet: Optional[str] = None) -> bool:
+    """
+    Return True if the parsed result looks suspicious and should not be trusted.
+    Conservative checks:
+      - missing/invalid price (can't parse)
+      - price parsed but < 20 and no currency context
+      - name looks like domain-only or placeholder
+      - price value appears across multiple different URLs (global suspicious)
+    """
+    # Name checks
+    dom = domain_from_url(url)
+    if name:
+        n = name.strip().lower()
+        # if name equals or contains domain string -> suspect
+        if dom and dom in n:
+            return True
+        # if name is just domain-like (like 'rozetka.com.ua') -> suspect
+        if is_domain_like(n) and len(n.split()) == 1:
+            return True
+
+    # Price checks
+    if not price_text:
+        return True  # missing price is suspicious in many cases
+
+    cp = clean_price_text(price_text)
+    if not cp:
+        return True
+
+    try:
+        num = float(cp)
+    except:
+        return True
+
+    # global suspicious values (appearing across many URLs)
+    if price_marked_globally_suspicious(cp):
+        return True
+
+    # if no currency text and numeric value < 20 and not a likely sale price -> suspect
+    if not contains_currency(price_text) and num < 20:
+        # small numbers might be weight, count, rating etc.
+        return True
+
+    # otherwise, looks acceptable
+    return False
+
+# ---- Playwright extraction (improved, shorter timeouts, domcontentloaded) ----
+def extract_with_playwright_direct(url: str, domain_cfg: dict | None = None, wait_for_price_sec: int = 12):
     result = {"name": None, "price_text": None, "old_price_text": None, "html": None}
     last_exc = None
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
-        page = browser.new_page()
+        # make viewport somewhat desktop-like; sometimes mobile view hides prices
+        page = browser.new_page(viewport={"width": 1200, "height": 800})
         page.set_extra_http_headers({
             "User-Agent": random.choice(USER_AGENTS),
             "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Referer": "https://www.google.com/"
         })
         try:
-            page.goto(url, timeout=140000)
+            # Prefer faster event: DOMContentLoaded, not full 'load'
             try:
-                page.wait_for_load_state('networkidle', timeout=70000)
+                page.goto(url, timeout=30000, wait_until="domcontentloaded")
+            except PlaywrightTimeout:
+                # second chance with longer, still bounded
+                page.goto(url, timeout=60000, wait_until="domcontentloaded")
+
+            # Try to wait a bit for networkidle but don't block too long
+            try:
+                page.wait_for_load_state('networkidle', timeout=15000)
             except PlaywrightTimeout:
                 pass
-            page.wait_for_timeout(500)
+            page.wait_for_timeout(300)
 
             if domain_cfg:
-                # name з циклом очікування
+                # name with waiting loop
                 for sel in domain_cfg.get("name", []):
                     try:
                         el = page.locator(sel).first
@@ -416,13 +504,13 @@ def extract_with_playwright_direct(url: str, domain_cfg: dict | None = None, wai
                         end_time = time.time() + wait_for_price_sec
                         while time.time() < end_time:
                             try:
-                                txt = el.inner_text(timeout=2000).strip()
+                                txt = el.inner_text(timeout=1200).strip()
                             except Exception:
                                 txt = ""
                             if txt and all(kw not in txt.lower() for kw in PLACEHOLDER_KEYWORDS):
                                 result["name"] = txt
                                 break
-                            time.sleep(0.4)
+                            time.sleep(0.25)
                         if result["name"]:
                             break
                     except Exception:
@@ -445,13 +533,13 @@ def extract_with_playwright_direct(url: str, domain_cfg: dict | None = None, wai
                         end_time = time.time() + wait_for_price_sec
                         while time.time() < end_time:
                             try:
-                                txt = el.inner_text(timeout=2000).strip()
+                                txt = el.inner_text(timeout=1200).strip()
                             except Exception:
                                 txt = ""
                             if text_has_digits_and_not_placeholder(txt):
                                 result["price_text"] = txt
                                 break
-                            time.sleep(0.4)
+                            time.sleep(0.25)
                         if result["price_text"]:
                             break
                     except Exception:
@@ -462,7 +550,7 @@ def extract_with_playwright_direct(url: str, domain_cfg: dict | None = None, wai
                     try:
                         el = page.locator(sel).first
                         if el.count() > 0:
-                            txt = el.inner_text(timeout=2000).strip()
+                            txt = el.inner_text(timeout=1200).strip()
                             if text_has_digits_and_not_placeholder(txt):
                                 result["old_price_text"] = txt
                                 break
@@ -470,6 +558,18 @@ def extract_with_playwright_direct(url: str, domain_cfg: dict | None = None, wai
                         continue
 
             result["html"] = page.content()
+            # quick blocked detection: title contains domain or obvious captcha text
+            try:
+                title = page.title()
+            except Exception:
+                title = ""
+            dom = domain_from_url(url)
+            lowtitle = (title or "").lower()
+            if dom and dom in lowtitle and (not result["price_text"] and not result["name"]):
+                # likely a placeholder / blocked page
+                browser.close()
+                raise Exception("Page looks like domain placeholder / blocked (title contains domain)")
+
             browser.close()
             return result
 
@@ -482,28 +582,117 @@ def extract_with_playwright_direct(url: str, domain_cfg: dict | None = None, wai
                 pass
             raise last_exc
 
-# ---- Robust fetch: multiple playwright attempts then requests fallback ----
-def robust_fetch_html(url: str, domain_cfg: dict | None = None, playwright_attempts: int = 2, requests_attempts: int = 3):
+# ---- Robust fetch: requests-first then Playwright as fallback + heuristics ----
+def robust_fetch_html(url: str, domain_cfg: dict | None = None, playwright_attempts: int = 2, requests_attempts: int = 2):
     start_time = time.time()
-    # 1) Playwright attempts
+
+    # ---------- 1) Quick requests-first attempt (fast) ----------
+    try:
+        html = parse_using_requests(url, timeout=8)
+        if html and len(html) > 200:
+            soup = BeautifulSoup(html, "html.parser")
+            # Try ld+json first
+            extracted = {}
+            for item in extract_ld_json(soup):
+                if not extracted.get("name"):
+                    cand = item.get("name") or item.get("headline")
+                    if cand and is_valid_name_candidate(cand):
+                        extracted["name"] = cand
+                if not extracted.get("price_text"):
+                    p = price_from_ld(item)
+                    if p:
+                        extracted["price_text"] = p
+                if extracted.get("name") and extracted.get("price_text"):
+                    break
+
+            # Domain-specific selectors fallback
+            if domain_cfg:
+                if not extracted.get("price_text"):
+                    for sel in domain_cfg.get("price", []):
+                        tag = soup.select_one(sel)
+                        if tag:
+                            if tag.name == "meta":
+                                cp_text = tag.get("content", "").strip()
+                            else:
+                                cp_text = tag.get_text(" ", strip=True)
+                            if cp_text and text_has_digits_and_not_placeholder(cp_text):
+                                extracted["price_text"] = cp_text
+                                break
+                if not extracted.get("name"):
+                    for sel in domain_cfg.get("name", []):
+                        tag = soup.select_one(sel)
+                        if tag:
+                            txt = tag.get_text(" ", strip=True)
+                            if txt and is_valid_name_candidate(txt):
+                                extracted["name"] = txt
+                                break
+
+            # best-effort fallback
+            if not extracted.get("price_text"):
+                cp, op, ptag = find_best_price(soup)
+                if cp:
+                    extracted["price_text"] = cp
+                if op:
+                    extracted["old_price_text"] = op
+            if not extracted.get("name"):
+                name_try = find_best_name(soup, price_tag=ptag if 'ptag' in locals() else None)
+                if name_try:
+                    extracted["name"] = name_try
+
+            # If quick result looks acceptable -> return
+            if extracted.get("price_text") or extracted.get("name"):
+                # Validate quick result
+                suspect = is_suspect_result(url, extracted.get("name"), extracted.get("price_text"), html[:800] if html else None)
+                if not suspect:
+                    print(f"Requests quick success for {url} in {time.time()-start_time:.2f}s")
+                    return html, extracted
+                else:
+                    # record suspicious price (for later detection)
+                    cp_val = clean_price_text(extracted.get("price_text"))
+                    if cp_val:
+                        record_suspicious_price(cp_val, url)
+                    print(f"Requests quick produced suspect result for {url} -> will try Playwright")
+    except Exception as e:
+        print(f"Requests quick failed for {url}: {e}")
+
+    # ---------- 2) Playwright attempts (only if requests didn't give good result) ----------
+    last_exc = None
     for attempt in range(playwright_attempts):
         try:
-            extracted = extract_with_playwright_direct(url, domain_cfg=domain_cfg, wait_for_price_sec=20)
+            extracted = extract_with_playwright_direct(url, domain_cfg=domain_cfg, wait_for_price_sec=12)
             html = extracted.get("html") or ""
             if html and len(html) > 200:
-                print(f"Playwright success for {url} in {time.time() - start_time:.2f}s")
+                # basic heuristic: if suspect -> record and possibly fallback
+                suspect = is_suspect_result(url, extracted.get("name"), extracted.get("price_text"), html[:800] if html else None)
+                if suspect:
+                    cp_val = clean_price_text(extracted.get("price_text"))
+                    if cp_val:
+                        record_suspicious_price(cp_val, url)
+                    # If we have last-good cached -> return it immediately to avoid spurious result
+                    with CACHE_LOCK:
+                        lg = LAST_GOOD_CACHE.get(url)
+                        if lg and (time.time() - lg["ts"] <= LAST_GOOD_TTL):
+                            print(f"Playwright returned suspect for {url}, returning LAST_GOOD cached result instead.")
+                            return lg["html"] if lg.get("html") else html, {
+                                "name": lg["name"],
+                                "price_text": lg["currentPrice"],
+                                "old_price_text": lg.get("oldPrice")
+                            }
+                    # Otherwise try next attempt or fallback to requests fallback
+                    raise Exception("Playwright returned suspect result (likely blocked or placeholder)")
+                print(f"Playwright success for {url} in {time.time()-start_time:.2f}s")
                 return html, extracted
         except Exception as e:
+            last_exc = e
             print(f"Playwright attempt {attempt+1} failed for {url}: {e}")
-        time.sleep(random.uniform(0.5, 1.5))  # Random delay to avoid detection
+        time.sleep(random.uniform(0.5, 1.2))
 
-    # 2) fallback to requests
-    last_exc = None
+    # ---------- 3) fallback to requests with bigger timeout ----------
     for i in range(requests_attempts):
         try:
-            html = parse_using_requests(url, timeout=25)
-            if html and len(html) > 100:
-                print(f"Requests success for {url} in {time.time() - start_time:.2f}s")
+            html = parse_using_requests(url, timeout=20)
+            if html and len(html) > 200:
+                print(f"Requests fallback success for {url} in {time.time()-start_time:.2f}s")
                 return html, {}
         except Exception as e:
             last_exc = e
@@ -544,10 +733,10 @@ def parse_product(req: ParseRequest):
         inStock = None
         html = ""
 
-        # robust fetch
+        # robust fetch (requests-first then Playwright fallback)
         html, extracted = robust_fetch_html(url, domain_cfg=domain_cfg)
 
-        # Якщо playwright повернув щось в extracted — підхоплюємо name/price/old
+        # If playwright/requests returned something in extracted — adopt it carefully
         if isinstance(extracted, dict) and extracted:
             if extracted.get("name"):
                 cand = extracted["name"].strip()
@@ -556,6 +745,7 @@ def parse_product(req: ParseRequest):
             if extracted.get("price_text"):
                 cp = clean_price_text(extracted["price_text"])
                 if cp:
+                    # accept price if currency present OR value >= 20
                     if contains_currency(extracted["price_text"]) or float(cp) >= 20:
                         currentPrice = cp
             if extracted.get("old_price_text"):
@@ -568,7 +758,7 @@ def parse_product(req: ParseRequest):
 
         soup = BeautifulSoup(html, "html.parser")
 
-        # ld+json
+        # ld+json parsing (if still missing)
         if not name or not currentPrice:
             for item in extract_ld_json(soup):
                 if not name:
@@ -665,10 +855,42 @@ def parse_product(req: ParseRequest):
                         else:
                             currentPrice = cp
 
+        # Finalize defaults
         name = name or "Невідома назва"
         currentPrice = currentPrice or "Невідома ціна"
         oldPrice = oldPrice or None
         inStock = bool(inStock if inStock is not None else (currentPrice and currentPrice != "Невідома ціна"))
+
+        # Final suspect check: if suspect AND we have last-good cached -> return last-good instead
+        suspect_final = is_suspect_result(url, name if name != "Невідома назва" else None, currentPrice if currentPrice != "Невідома ціна" else None, html[:800] if html else None)
+        if suspect_final:
+            cp_val = None
+            try:
+                cp_val = clean_price_text(currentPrice)
+            except Exception:
+                cp_val = None
+            if cp_val:
+                record_suspicious_price(cp_val, url)
+            with CACHE_LOCK:
+                lg = LAST_GOOD_CACHE.get(url)
+                if lg and (time.time() - lg["ts"] <= LAST_GOOD_TTL):
+                    # return cached good result
+                    print(f"parse_product: final result for {url} suspicious, returning LAST_GOOD cached result")
+                    return ParseResponse(name=lg["name"], currentPrice=lg["currentPrice"], oldPrice=lg.get("oldPrice"), inStock=lg.get("inStock", True))
+            # else allow returning the "Невідома ..." or suspicious result to client
+            if name == "Невідома назва" and currentPrice == "Невідома ціна":
+                return ParseResponse(name="Помилка завантаження", currentPrice="Помилка", oldPrice=None, inStock=False)
+
+        # If we reach here and result is plausible -> update LAST_GOOD cache
+        with CACHE_LOCK:
+            LAST_GOOD_CACHE[url] = {
+                "ts": time.time(),
+                "name": name,
+                "currentPrice": currentPrice,
+                "oldPrice": oldPrice,
+                "inStock": inStock,
+                "html": html if isinstance(html, str) and len(html) < 20000 else None  # avoid huge html caching
+            }
 
         total_time = time.time() - start_time
         print(f"parse_product debug (time: {total_time:.2f}s):", {"url": url, "name": name, "currentPrice": currentPrice, "oldPrice": oldPrice, "inStock": inStock})
@@ -678,4 +900,10 @@ def parse_product(req: ParseRequest):
     except Exception as e:
         print("Error in parse_product:", e)
         traceback.print_exc()
+        # If we have last-good, return it instead of unknown to protect users from wrong push
+        with CACHE_LOCK:
+            lg = LAST_GOOD_CACHE.get(url)
+            if lg and (time.time() - lg["ts"] <= LAST_GOOD_TTL):
+                print(f"parse_product: exception for {url}, returning LAST_GOOD cached result")
+                return ParseResponse(name=lg["name"], currentPrice=lg["currentPrice"], oldPrice=lg.get("oldPrice"), inStock=lg.get("inStock", True))
         return ParseResponse(name="Невідома назва", currentPrice="Невідома ціна", oldPrice=None, inStock=False)
